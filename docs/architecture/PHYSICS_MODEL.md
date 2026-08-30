@@ -56,4 +56,3 @@ A capability lease defines the reachable subgraph allowed by principal, tenant,
 scope, side-effect contract, schema, deadline, budget, route policy, and network
 policy. An invocation outside that graph fails before execution. “Causal cone” is
 only the name for that software reachability bound.
-
