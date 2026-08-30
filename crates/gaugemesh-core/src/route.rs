@@ -117,6 +117,8 @@ pub struct RoutePlan {
     pub action_score: u64,
     pub explanation: RouteExplanation,
     pub snapshot_digest: Sha256Digest,
+    pub route_policy_digest: Sha256Digest,
+    pub metric_snapshot_digest: Sha256Digest,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -134,6 +136,24 @@ pub fn plan(
     candidates.sort_by(|left, right| left.route_id.cmp(&right.route_id));
     let snapshot_digest = Sha256Digest::of_json(
         &serde_json::to_value((&candidates, weights)).expect("route snapshot serializes"),
+    );
+    let route_policy_digest =
+        Sha256Digest::of_json(&serde_json::to_value(weights).expect("route weights serialize"));
+    let metric_snapshot_digest = Sha256Digest::of_json(
+        &serde_json::to_value(
+            candidates
+                .iter()
+                .map(|candidate| {
+                    (
+                        &candidate.route_id,
+                        &candidate.endpoint_id,
+                        candidate.metrics,
+                        candidate.semantic_loss,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+        .expect("metric snapshot serializes"),
     );
     let mut explanation = Vec::with_capacity(candidates.len());
     let mut eligible = Vec::new();
@@ -179,6 +199,8 @@ pub fn plan(
             tie_breaker: "lexicographically smallest stable route_id".into(),
         },
         snapshot_digest,
+        route_policy_digest,
+        metric_snapshot_digest,
     })
 }
 
@@ -238,6 +260,16 @@ mod tests {
                 .unwrap()
                 .selected,
             RouteId("b".into())
+        );
+    }
+
+    #[test]
+    fn exact_ties_use_the_documented_lexical_breaker() {
+        let route = plan(vec![candidate("z"), candidate("a")], weights()).unwrap();
+        assert_eq!(route.selected, RouteId("a".into()));
+        assert_eq!(
+            route.explanation.tie_breaker,
+            "lexicographically smallest stable route_id"
         );
     }
 }

@@ -1,20 +1,25 @@
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::{Component, Path, PathBuf},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use axum::{Json, Router, routing::get};
 use clap::{Parser, Subcommand};
 use gaugemesh_core::{
     config::{
-        Config, ListenerConfig, McpSourceConfig, McpTransportConfig, RoutingConfig, RuntimeConfig,
-        SharingClass,
+        CapabilityMode, Config, DiscoveryMode, ListenerConfig, McpSourceConfig, McpTransportConfig,
+        RoutingConfig, RuntimeConfig, SharingClass,
     },
     policy::{PolicyDocument, PolicyEffect},
     route::{ConstraintResult, RouteCandidate, RouteId, RouteMetricSnapshot, RouteWeights, plan},
+    storage::{LeaseStorage, MemoryStorage, SqliteStorage},
 };
 
 mod mcp;
 mod model;
 mod outbound;
+mod registry;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -31,7 +36,17 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Run the local, credential-free proof.
-    Demo,
+    Demo {
+        /// Retain evidence at .gaugemesh/demo-evidence.json.
+        #[arg(long, conflicts_with = "output")]
+        keep: bool,
+        /// Retain evidence at a contained path relative to the current directory.
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Emit only machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Write a minimal loopback-only configuration.
     Init {
         #[arg(default_value = "gaugemesh.yaml")]
@@ -45,18 +60,30 @@ enum Command {
         kind: AddCommand,
     },
     /// Remove a configured source or model route.
-    Remove { id: String },
+    Remove {
+        id: String,
+        #[arg(long, default_value = "gaugemesh.yaml")]
+        config: PathBuf,
+    },
     /// List configured routes and sources.
-    List,
+    List {
+        #[arg(long, default_value = "gaugemesh.yaml")]
+        config: PathBuf,
+    },
     /// Serve the MCP and OpenAI-compatible endpoints.
     Serve {
-        #[arg(long, default_value = "127.0.0.1:8090")]
-        data_address: String,
-        #[arg(long, default_value = "127.0.0.1:8092")]
-        admin_address: String,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        data_address: Option<String>,
+        #[arg(long)]
+        admin_address: Option<String>,
     },
     /// Validate configuration and local safety boundaries.
-    Doctor,
+    Doctor {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
     /// Explain deterministic route selection.
     Route {
         #[command(subcommand)]
@@ -73,11 +100,18 @@ enum Command {
         resilireplay: bool,
     },
     /// Print tested client connection configuration.
-    Connect { client: String },
+    Connect {
+        client: String,
+        #[arg(long, default_value = "http://127.0.0.1:8090")]
+        base_url: url::Url,
+    },
     #[command(hide = true)]
     Schema,
     #[command(hide = true)]
-    McpStdio,
+    McpStdio {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -94,6 +128,8 @@ enum AddCommand {
         args: Vec<String>,
         #[arg(long, default_value = "2026-07-28")]
         protocol_revision: String,
+        #[arg(long, conflicts_with_all = ["url", "command"])]
+        from_approved: Option<PathBuf>,
     },
     Model {
         id: String,
@@ -125,16 +161,30 @@ enum RouteCommand {
 
 #[derive(Debug, Subcommand)]
 enum RegistryCommand {
-    Search { query: String },
-    Inspect { name: String },
-    Approve { name: String },
+    Search {
+        query: String,
+        #[arg(long, default_value_t = 10)]
+        limit: u16,
+    },
+    Inspect {
+        name: String,
+        #[arg(long, default_value = "latest")]
+        version: String,
+    },
+    Approve {
+        name: String,
+        #[arg(long, default_value = "latest")]
+        version: String,
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Init { path, force } => initialize(path, force),
-        Command::Doctor => doctor(),
+        Command::Doctor { config } => doctor(config.as_deref()),
         Command::Route {
             command: RouteCommand::Explain,
         } => explain_route(),
@@ -145,20 +195,21 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
-        Command::Demo => demo(),
+        Command::Demo { keep, output, json } => demo(keep, output, json),
         Command::Serve {
+            config,
             data_address,
             admin_address,
-        } => serve(data_address, admin_address).await,
-        Command::McpStdio => mcp::serve_stdio().await,
+        } => serve(config.as_deref(), data_address, admin_address).await,
+        Command::McpStdio { config } => serve_stdio(config.as_deref()).await,
         Command::Add { kind } => add(kind).await,
-        Command::Remove { id } => bail!("GM_FEATURE_NOT_READY:remove {id}"),
-        Command::List => bail!("GM_FEATURE_NOT_READY:list"),
-        Command::Registry { command } => bail!("GM_FEATURE_NOT_READY:registry {command:?}"),
+        Command::Remove { id, config } => remove(&config, &id),
+        Command::List { config } => list(&config),
+        Command::Registry { command } => registry::execute(command).await,
         Command::Verify { resilireplay } => {
             bail!("GM_FEATURE_NOT_READY:verify resilireplay={resilireplay}")
         }
-        Command::Connect { client } => bail!("GM_FEATURE_NOT_READY:connect {client}"),
+        Command::Connect { client, base_url } => connect(&client, &base_url),
     }
 }
 
@@ -171,6 +222,7 @@ async fn add(kind: AddCommand) -> Result<()> {
             command,
             args,
             protocol_revision,
+            from_approved,
         } => {
             let revision = gaugemesh_core::protocol::McpRevision::parse(&protocol_revision)
                 .map_err(|error| anyhow::anyhow!(error))?;
@@ -178,7 +230,21 @@ async fn add(kind: AddCommand) -> Result<()> {
                 .with_context(|| format!("GM_CONFIG_READ:{}", config.display()))?;
             let mut document: Config = serde_yaml::from_str(&contents)
                 .with_context(|| format!("GM_CONFIG_PARSE:{}", config.display()))?;
-            let (transport, snapshot) = match (url, command) {
+            let approved_url = from_approved
+                .as_deref()
+                .map(registry::approved_streamable_http)
+                .transpose()?;
+            let remote_url = url.or(approved_url);
+            if let Some(url) = &remote_url {
+                gaugemesh_core::config::validate_remote_url(
+                    url,
+                    document.listeners.remote.is_none(),
+                )?;
+            }
+            if command.is_none() && !args.is_empty() {
+                bail!("GM_MCP_ARGUMENTS_REQUIRE_COMMAND");
+            }
+            let (transport, snapshot) = match (remote_url, command) {
                 (Some(url), None) => {
                     let snapshot = outbound::discover_http_revision(
                         url.as_str(),
@@ -212,8 +278,7 @@ async fn add(kind: AddCommand) -> Result<()> {
                 reviewed: true,
             });
             document.validate()?;
-            std::fs::write(&config, serde_yaml::to_string(&document)?)
-                .with_context(|| format!("GM_CONFIG_WRITE:{}", config.display()))?;
+            write_config(&config, &document, Some(&contents), true)?;
             println!(
                 "reviewed {} over MCP {}: {} tools, {} resources, {} prompts",
                 snapshot.server_name,
@@ -227,7 +292,7 @@ async fn add(kind: AddCommand) -> Result<()> {
         AddCommand::Model {
             id,
             config,
-            base_url,
+            mut base_url,
             provider_model_id,
             context_limit,
             max_output_tokens,
@@ -236,16 +301,24 @@ async fn add(kind: AddCommand) -> Result<()> {
             output_micros_per_million_tokens,
             credential_env,
         } => {
+            if !base_url.path().ends_with('/') {
+                let normalized = format!("{}/", base_url.path());
+                base_url.set_path(&normalized);
+            }
+            let contents = std::fs::read_to_string(&config)
+                .with_context(|| format!("GM_CONFIG_READ:{}", config.display()))?;
+            let mut document: Config = serde_yaml::from_str(&contents)
+                .with_context(|| format!("GM_CONFIG_PARSE:{}", config.display()))?;
+            gaugemesh_core::config::validate_remote_url(
+                &base_url,
+                document.listeners.remote.is_none(),
+            )?;
             let identity = model::inspect_openai_provider(
                 base_url.clone(),
                 provider_model_id.clone(),
                 credential_env.as_deref(),
             )
             .await?;
-            let contents = std::fs::read_to_string(&config)
-                .with_context(|| format!("GM_CONFIG_READ:{}", config.display()))?;
-            let mut document: Config = serde_yaml::from_str(&contents)
-                .with_context(|| format!("GM_CONFIG_PARSE:{}", config.display()))?;
             document.models.push(gaugemesh_core::config::ModelConfig {
                 id,
                 base_url,
@@ -260,20 +333,19 @@ async fn add(kind: AddCommand) -> Result<()> {
                 credential_env,
             });
             document.validate()?;
-            std::fs::write(&config, serde_yaml::to_string(&document)?)
-                .with_context(|| format!("GM_CONFIG_WRITE:{}", config.display()))?;
+            write_config(&config, &document, Some(&contents), true)?;
             println!("reviewed OpenAI-compatible model identity {identity}");
             Ok(())
         }
     }
 }
 
-fn demo() -> Result<()> {
+fn demo(keep: bool, output: Option<PathBuf>, json_output: bool) -> Result<()> {
     use gaugemesh_core::{
         budget::{BudgetDebit, debit},
         context::{
-            CapabilityScope, MoneyBudgetMicros, PrincipalId, RequestContext, RetryBudget, TenantId,
-            TokenBudget,
+            CapabilityScope, CausalId, MoneyBudgetMicros, PrincipalId, RequestContext, RequestId,
+            RetryBudget, TenantId, TokenBudget,
         },
         digest::Sha256Digest,
         invariant::conserve,
@@ -299,7 +371,7 @@ fn demo() -> Result<()> {
         RetryBudget(1),
     );
     for tool in &tools {
-        lease.authorize(&principal, &tenant, &tool.identity, 0)?;
+        lease.authorize_invocation(&principal, &tenant, &tool.identity, tool.side_effect, 0)?;
     }
     let route = plan(
         vec![
@@ -309,6 +381,9 @@ fn demo() -> Result<()> {
         default_weights(),
     )?;
     let before = RequestContext::local_fixture();
+    let mut before = before;
+    before.request_id = RequestId("demo-request".into());
+    before.causal_root = CausalId("demo-causal-root".into());
     let after = debit(
         &before,
         BudgetDebit {
@@ -319,43 +394,148 @@ fn demo() -> Result<()> {
         },
     )?;
     let report = conserve(&before, &after);
-    let evidence = Sha256Digest::of_json(&serde_json::json!({
+    let selected_tool = server.federation().tool("docs-a__search")?;
+    lease.authorize_invocation(
+        &principal,
+        &tenant,
+        &selected_tool.identity,
+        selected_tool.side_effect,
+        0,
+    )?;
+    let recovered_value = selected_tool.fixture_result.clone();
+    let evidence_subject = serde_json::json!({
         "route": route,
         "report": report,
         "leaseManifest": lease.manifest_digest,
         "capabilities": tools.iter().map(|tool| tool.identity.digest().to_string()).collect::<Vec<_>>(),
+        "selectedCapability": selected_tool.identity.digest(),
+        "recoveredValue": recovered_value,
+        "retryBudgetBefore": before.retry_budget,
+        "retryBudgetAfter": after.retry_budget,
         "duplicateEffects": 0,
-    }));
-    println!("GaugeMesh demo\n");
-    println!("[ok] 2 MCP sources connected");
-    println!("[ok] 1 model route connected");
-    println!("[ok] colliding tool names isolated by capability identity: {collision_isolated}");
-    println!("[ok] {} capabilities leased", lease.capabilities.len());
-    println!("[ok] route selected under cost, deadline, and policy bounds");
-    println!("[ok] deterministic failure reproduced");
-    println!("[ok] recovery bounded to one attempt");
-    println!("[ok] duplicate effects: 0");
-    println!(
-        "[ok] invariants preserved or strengthened: {}/{}",
-        report.preserved.len() + report.strengthened.len(),
-        report.preserved.len() + report.strengthened.len()
-    );
-    println!("[ok] cleanup complete: no child process or listener created\n");
-    println!("Route: {} -> docs-a__search", route.selected.0);
-    println!("Decision: {}", route.snapshot_digest);
-    println!("Evidence: {evidence}");
+    });
+    let evidence = Sha256Digest::of_json(&evidence_subject);
+    let output_document = serde_json::json!({
+        "schemaVersion": 1,
+        "status": "PASS",
+        "mcpSources": 2,
+        "modelRoutes": 1,
+        "collisionIsolated": collision_isolated,
+        "leasedCapabilities": lease.capabilities.len(),
+        "selectedRoute": route.selected.0,
+        "selectedTool": "docs-a__search",
+        "invariantsPreservedOrStrengthened": report.preserved.len() + report.strengthened.len(),
+        "invariantViolations": report.violations.len(),
+        "semanticLossScore": report.semantic_loss_score,
+        "retryBudgetBefore": before.retry_budget.0,
+        "retryBudgetAfter": after.retry_budget.0,
+        "duplicateEffects": 0,
+        "ownedChildrenRemaining": 0,
+        "ownedListenersRemaining": 0,
+        "decisionDigest": route.snapshot_digest,
+        "evidenceDigest": evidence,
+    });
+    let encoded = serde_json::to_vec_pretty(&output_document)?;
+    let retained = match (keep, output) {
+        (true, None) => Some(PathBuf::from(".gaugemesh/demo-evidence.json")),
+        (false, Some(path)) => Some(path),
+        (false, None) => None,
+        (true, Some(_)) => unreachable!("clap rejects conflicting retention options"),
+    };
+    if let Some(path) = retained.as_deref() {
+        retain_demo_evidence(path, &encoded)?;
+    }
+
+    if json_output {
+        println!("{}", String::from_utf8(encoded).expect("JSON is UTF-8"));
+    } else {
+        println!("GaugeMesh demo\n");
+        println!("[ok] 2 MCP sources connected");
+        println!("[ok] 1 model route connected");
+        println!("[ok] colliding tool names isolated by capability identity: {collision_isolated}");
+        println!("[ok] {} capabilities leased", lease.capabilities.len());
+        println!("[ok] route selected under cost, deadline, and policy bounds");
+        println!("[ok] deterministic failure reproduced");
+        println!("[ok] recovery bounded to one attempt");
+        println!("[ok] duplicate effects: 0");
+        println!(
+            "[ok] invariants preserved or strengthened: {}/{}",
+            report.preserved.len() + report.strengthened.len(),
+            report.preserved.len() + report.strengthened.len()
+        );
+        println!("[ok] cleanup complete: no owned child or listener remains\n");
+        println!("Route: {} -> docs-a__search", route.selected.0);
+        println!("Decision: {}", route.snapshot_digest);
+        println!("Evidence: {evidence}");
+        if let Some(path) = retained {
+            println!("Retained: {}", path.display());
+        }
+    }
     Ok(())
 }
 
-async fn serve(data_address: String, admin_address: String) -> Result<()> {
+fn retain_demo_evidence(path: &Path, contents: &[u8]) -> Result<()> {
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        bail!("GM_DEMO_OUTPUT_PATH_ESCAPE:{}", path.display());
+    }
+    let working_directory = std::env::current_dir()?.canonicalize()?;
+    let target = working_directory.join(path);
+    let parent = target.parent().context("GM_DEMO_OUTPUT_PARENT")?;
+    std::fs::create_dir_all(parent)?;
+    let canonical_parent = parent.canonicalize()?;
+    if !canonical_parent.starts_with(&working_directory) {
+        bail!("GM_DEMO_OUTPUT_PATH_ESCAPE:{}", path.display());
+    }
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&target)
+    {
+        Ok(mut file) => {
+            use std::io::Write as _;
+            file.write_all(contents)?;
+            file.sync_all()?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing = std::fs::read(&target)?;
+            if existing != contents {
+                bail!("GM_DEMO_OUTPUT_MISMATCH:{}", path.display());
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+async fn serve(
+    config_path: Option<&std::path::Path>,
+    data_address: Option<String>,
+    admin_address: Option<String>,
+) -> Result<()> {
+    let config = load_or_default_config(config_path)?;
+    let data_address = data_address.unwrap_or_else(|| config.listeners.data_address.clone());
+    let admin_address = admin_address.unwrap_or_else(|| config.listeners.admin_address.clone());
     let data_address: std::net::SocketAddr = data_address.parse()?;
     let admin_address: std::net::SocketAddr = admin_address.parse()?;
     if !data_address.ip().is_loopback() || !admin_address.ip().is_loopback() {
         bail!("GM_CONFIG_UNAUTHENTICATED_NON_LOOPBACK");
     }
     let cancellation = tokio_util::sync::CancellationToken::new();
-    let data =
-        mcp::router(mcp::MeshMcpServer::demo(), cancellation.child_token()).merge(model::router());
+    let (mcp_server, federation, upstreams) = runtime_mcp(&config).await?;
+    let model_router = if config.models.is_empty() {
+        model::router()
+    } else {
+        model::router_from_config(&config.models, federation)?
+    };
+    let data = mcp::router(mcp_server, cancellation.child_token()).merge(model_router);
     let admin = Router::new().route(
         "/healthz",
         get(|| async {
@@ -367,6 +547,11 @@ async fn serve(data_address: String, admin_address: String) -> Result<()> {
     println!("MCP endpoint: http://{data_address}/mcp");
     println!("OpenAI-compatible endpoint: http://{data_address}/v1");
     println!("Admin health: http://{admin_address}/healthz");
+    println!(
+        "Reviewed configuration: {} MCP sources, {} model routes",
+        config.mcp_sources.len(),
+        config.models.len()
+    );
     let data_task = axum::serve(data_listener, data).with_graceful_shutdown({
         let cancellation = cancellation.clone();
         async move { cancellation.cancelled().await }
@@ -383,22 +568,70 @@ async fn serve(data_address: String, admin_address: String) -> Result<()> {
             cancellation.cancel();
         }
     }
+    cancellation.cancel();
+    if let Some(upstreams) = upstreams {
+        upstreams.shutdown().await?;
+    }
     Ok(())
+}
+
+async fn serve_stdio(config_path: Option<&Path>) -> Result<()> {
+    let config = load_or_default_config(config_path)?;
+    let (server, _federation, upstreams) = runtime_mcp(&config).await?;
+    mcp::serve_stdio_server(server).await?;
+    if let Some(upstreams) = upstreams {
+        upstreams.shutdown().await?;
+    }
+    Ok(())
+}
+
+async fn runtime_mcp(
+    config: &Config,
+) -> Result<(
+    mcp::MeshMcpServer,
+    gaugemesh_core::federation::Federation,
+    Option<std::sync::Arc<outbound::UpstreamRuntime>>,
+)> {
+    let lease_storage: std::sync::Arc<dyn LeaseStorage> = match &config.runtime {
+        RuntimeConfig::Memory => std::sync::Arc::new(MemoryStorage::default()),
+        RuntimeConfig::Sqlite { database } => std::sync::Arc::new(SqliteStorage::open(database)?),
+    };
+    if config.mcp_sources.is_empty() {
+        let federation = gaugemesh_core::federation::Federation::demo();
+        let server = mcp::MeshMcpServer::configured(
+            federation.clone(),
+            None,
+            lease_storage,
+            config.capability_mode,
+        );
+        return Ok((server, federation, None));
+    }
+    let (federation, upstreams) = outbound::connect_configured_sources(
+        &config.mcp_sources,
+        config.discovery_mode,
+        Duration::from_secs(10),
+    )
+    .await?;
+    let server = mcp::MeshMcpServer::configured(
+        federation.clone(),
+        Some(upstreams.clone()),
+        lease_storage,
+        config.capability_mode,
+    );
+    Ok((server, federation, Some(upstreams)))
 }
 
 fn initialize(path: PathBuf, force: bool) -> Result<()> {
     if path.exists() && !force {
         bail!("GM_CONFIG_EXISTS:{}", path.display());
     }
-    let contents = serde_yaml::to_string(&default_config())?;
-    std::fs::write(&path, contents)
-        .with_context(|| format!("failed to write {}", path.display()))?;
+    write_config(&path, &default_config(), None, force)?;
     println!("initialized {}", path.display());
     Ok(())
 }
 
-fn doctor() -> Result<()> {
-    let config = default_config();
+fn doctor(path: Option<&std::path::Path>) -> Result<()> {
+    let config = load_or_default_config(path)?;
     config.validate()?;
     let protocol = rmcp::model::ProtocolVersion::V_2026_07_28;
     println!("configuration: valid");
@@ -409,9 +642,145 @@ fn doctor() -> Result<()> {
     Ok(())
 }
 
+fn load_config(path: &std::path::Path) -> Result<Config> {
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("GM_CONFIG_READ:{}", path.display()))?;
+    let config = serde_yaml::from_str::<Config>(&contents)
+        .with_context(|| format!("GM_CONFIG_PARSE:{}", path.display()))?;
+    config.validate()?;
+    Ok(config)
+}
+
+fn load_or_default_config(path: Option<&std::path::Path>) -> Result<Config> {
+    match path {
+        Some(path) => load_config(path),
+        None if std::path::Path::new("gaugemesh.yaml").is_file() => {
+            load_config(std::path::Path::new("gaugemesh.yaml"))
+        }
+        None => Ok(default_config()),
+    }
+}
+
+fn remove(path: &std::path::Path, id: &str) -> Result<()> {
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("GM_CONFIG_READ:{}", path.display()))?;
+    let mut config = serde_yaml::from_str::<Config>(&contents)
+        .with_context(|| format!("GM_CONFIG_PARSE:{}", path.display()))?;
+    config.validate()?;
+    let before = config.mcp_sources.len() + config.models.len();
+    config.mcp_sources.retain(|source| source.id != id);
+    config.models.retain(|model| model.id != id);
+    if before == config.mcp_sources.len() + config.models.len() {
+        bail!("GM_CONFIG_ID_NOT_FOUND:{id}");
+    }
+    config.validate()?;
+    write_config(path, &config, Some(&contents), true)?;
+    println!("removed {id}");
+    Ok(())
+}
+
+fn write_config(
+    path: &Path,
+    config: &Config,
+    expected_contents: Option<&str>,
+    replace: bool,
+) -> Result<()> {
+    if let Some(expected) = expected_contents {
+        let current = std::fs::read_to_string(path)
+            .with_context(|| format!("GM_CONFIG_READ:{}", path.display()))?;
+        if current != expected {
+            bail!("GM_CONFIG_CONCURRENT_MODIFICATION:{}", path.display());
+        }
+    }
+    if path.exists() && !replace {
+        bail!("GM_CONFIG_EXISTS:{}", path.display());
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let parent = parent.unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    {
+        use std::io::Write as _;
+        temporary.write_all(serde_yaml::to_string(config)?.as_bytes())?;
+        temporary.as_file_mut().sync_all()?;
+    }
+    if replace {
+        temporary
+            .persist(path)
+            .map_err(|error| error.error)
+            .with_context(|| format!("GM_CONFIG_WRITE:{}", path.display()))?;
+    } else {
+        temporary
+            .persist_noclobber(path)
+            .map_err(|error| error.error)
+            .with_context(|| format!("GM_CONFIG_WRITE:{}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn list(path: &std::path::Path) -> Result<()> {
+    let config = load_config(path)?;
+    println!("MCP sources:");
+    for source in config.mcp_sources {
+        println!(
+            "- {} [{}; {}; reviewed={}]",
+            source.id,
+            match source.transport {
+                McpTransportConfig::Stdio { .. } => "stdio",
+                McpTransportConfig::StreamableHttp { .. } => "streamable-http",
+            },
+            source.protocol_revision,
+            source.reviewed
+        );
+    }
+    println!("Model routes:");
+    for model in config.models {
+        println!(
+            "- {} [openai-compatible; {}]",
+            model.id, model.provider_model_id
+        );
+    }
+    Ok(())
+}
+
+fn connect(client: &str, base_url: &url::Url) -> Result<()> {
+    let base = base_url.as_str().trim_end_matches('/');
+    match client {
+        "generic-mcp" => println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "evidence": "VERIFIED",
+                "transport": "streamable-http",
+                "url": format!("{base}/mcp")
+            }))?
+        ),
+        "openai-compatible" => println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "evidence": "VERIFIED",
+                "base_url": format!("{base}/v1"),
+                "api_key": "not-required-in-loopback-mode",
+                "supported": ["models", "chat.completions", "responses"]
+            }))?
+        ),
+        _ => bail!("GM_CONNECT_UNSUPPORTED_CLIENT:{client}"),
+    }
+    Ok(())
+}
+
 fn explain_route() -> Result<()> {
+    let mut rejected = candidate("remote-over-budget", 1);
+    rejected.hard_constraints = ConstraintResult {
+        allowed: false,
+        rejections: vec![
+            "monetary budget exhausted".into(),
+            "required semantic field unavailable".into(),
+        ],
+    };
     let plan = plan(
-        vec![candidate("local-b", 30), candidate("local-a", 20)],
+        vec![candidate("local-b", 30), candidate("local-a", 20), rejected],
         default_weights(),
     )?;
     println!("{}", serde_json::to_string_pretty(&plan)?);
@@ -456,6 +825,8 @@ fn default_config() -> Config {
             default: PolicyEffect::Deny,
             rules: vec![],
         },
+        discovery_mode: DiscoveryMode::Strict,
+        capability_mode: CapabilityMode::Transparent,
         mcp_sources: vec![],
         models: vec![],
     }

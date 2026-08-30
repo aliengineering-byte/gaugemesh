@@ -51,11 +51,25 @@ pub struct FederatedPrompt {
     pub template: String,
 }
 
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FederatedResourceTemplate {
+    pub identity: CapabilityId,
+    pub virtual_uri_template: String,
+    pub virtual_prefix: String,
+    pub native_uri_template: String,
+    pub name: String,
+    pub description: String,
+    pub mime_type: Option<String>,
+    pub variables: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Federation {
     tools: BTreeMap<String, FederatedTool>,
     resources: BTreeMap<String, FederatedResource>,
     prompts: BTreeMap<String, FederatedPrompt>,
+    templates: BTreeMap<String, FederatedResourceTemplate>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -96,6 +110,18 @@ impl Federation {
         Ok(())
     }
 
+    pub fn insert_template(
+        &mut self,
+        template: FederatedResourceTemplate,
+    ) -> Result<(), FederationError> {
+        if self.templates.contains_key(&template.virtual_uri_template) {
+            return Err(FederationError::AliasCollision);
+        }
+        self.templates
+            .insert(template.virtual_uri_template.clone(), template);
+        Ok(())
+    }
+
     pub fn tools(&self) -> impl Iterator<Item = &FederatedTool> {
         self.tools.values()
     }
@@ -108,6 +134,10 @@ impl Federation {
         self.prompts.values()
     }
 
+    pub fn templates(&self) -> impl Iterator<Item = &FederatedResourceTemplate> {
+        self.templates.values()
+    }
+
     pub fn tool(&self, alias: &str) -> Result<&FederatedTool, FederationError> {
         self.tools.get(alias).ok_or(FederationError::NotFound)
     }
@@ -118,6 +148,25 @@ impl Federation {
 
     pub fn prompt(&self, alias: &str) -> Result<&FederatedPrompt, FederationError> {
         self.prompts.get(alias).ok_or(FederationError::NotFound)
+    }
+
+    pub fn resolve_template(
+        &self,
+        virtual_uri: &str,
+    ) -> Option<(&FederatedResourceTemplate, String)> {
+        self.templates.values().find_map(|template| {
+            let suffix = virtual_uri.strip_prefix(&template.virtual_prefix)?;
+            let encoded_values = suffix.split('/').collect::<Vec<_>>();
+            if encoded_values.len() != template.variables.len() {
+                return None;
+            }
+            let mut native = template.native_uri_template.clone();
+            for (variable, encoded) in template.variables.iter().zip(encoded_values) {
+                let value = percent_decode(encoded)?;
+                native = native.replace(&format!("{{{variable}}}"), &value);
+            }
+            Some((template, native))
+        })
     }
 
     pub fn search(&self, query: &str, limit: usize) -> Vec<&FederatedTool> {
@@ -186,18 +235,17 @@ impl Federation {
     }
 
     pub fn rmcp_templates(&self) -> Vec<ResourceTemplate> {
-        let sources = self
-            .resources
+        self.templates
             .values()
-            .map(|resource| resource.identity.source.0.clone())
-            .collect::<std::collections::BTreeSet<_>>();
-        sources
-            .into_iter()
-            .map(|source| {
-                ResourceTemplate::new(
-                    format!("gaugemesh://resource/{source}/{{opaque-id}}"),
-                    format!("{source} resources"),
-                )
+            .map(|template| {
+                let mut item =
+                    ResourceTemplate::new(&template.virtual_uri_template, &template.name)
+                        .with_description(&template.description)
+                        .with_meta(rmcp::model::MetaObject(metadata(&template.identity)));
+                if let Some(mime_type) = &template.mime_type {
+                    item = item.with_mime_type(mime_type);
+                }
+                item
             })
             .collect()
     }
@@ -313,6 +361,33 @@ fn tokens(value: &str) -> Vec<String> {
         .filter(|token| !token.is_empty())
         .map(str::to_lowercase)
         .collect()
+}
+
+fn percent_decode(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let high = *bytes.get(index + 1)?;
+            let low = *bytes.get(index + 2)?;
+            decoded.push(hex_value(high)? * 16 + hex_value(low)?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn hex_value(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

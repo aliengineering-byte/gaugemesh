@@ -60,6 +60,10 @@ pub enum PolicyCompileError {
     AmbiguousPriority(u32),
     #[error("GM_POLICY_DUPLICATE_RULE:{0}")]
     DuplicateRule(String),
+    #[error("GM_POLICY_CONTRADICTORY_RULE:{0}")]
+    ContradictoryRule(String),
+    #[error("GM_POLICY_UNREACHABLE_RULE:{0}")]
+    UnreachableRule(String),
 }
 
 #[derive(Clone, Debug)]
@@ -109,10 +113,28 @@ pub fn compile(mut document: PolicyDocument) -> Result<CompiledPolicy, PolicyCom
                 });
             }
         }
+        let mut equalities = BTreeMap::new();
+        for condition in &rule.all {
+            if equalities
+                .insert(&condition.field, &condition.equals)
+                .is_some_and(|previous| previous != &condition.equals)
+            {
+                return Err(PolicyCompileError::ContradictoryRule(rule.id.clone()));
+            }
+        }
     }
     document.rules.sort_by(|left, right| {
         (left.phase, left.priority, &left.id).cmp(&(right.phase, right.priority, &right.id))
     });
+    let mut terminal_phases = BTreeSet::new();
+    for rule in &document.rules {
+        if terminal_phases.contains(&rule.phase) {
+            return Err(PolicyCompileError::UnreachableRule(rule.id.clone()));
+        }
+        if rule.all.is_empty() {
+            terminal_phases.insert(rule.phase);
+        }
+    }
     Ok(CompiledPolicy(document))
 }
 
@@ -156,5 +178,59 @@ mod tests {
             result,
             Err(PolicyCompileError::FieldUnavailable { .. })
         ));
+    }
+
+    #[test]
+    fn contradictory_and_unreachable_rules_fail_at_compile_time() {
+        let contradictory = PolicyDocument {
+            default: PolicyEffect::Deny,
+            rules: vec![PolicyRule {
+                id: "never".into(),
+                phase: PolicyPhase::Discovery,
+                priority: 1,
+                effect: PolicyEffect::Allow,
+                all: vec![
+                    Condition {
+                        field: "tenant.id".into(),
+                        equals: "a".into(),
+                    },
+                    Condition {
+                        field: "tenant.id".into(),
+                        equals: "b".into(),
+                    },
+                ],
+            }],
+        };
+        assert_eq!(
+            compile(contradictory).unwrap_err(),
+            PolicyCompileError::ContradictoryRule("never".into())
+        );
+
+        let unreachable = PolicyDocument {
+            default: PolicyEffect::Deny,
+            rules: vec![
+                PolicyRule {
+                    id: "terminal".into(),
+                    phase: PolicyPhase::Discovery,
+                    priority: 1,
+                    effect: PolicyEffect::Deny,
+                    all: vec![],
+                },
+                PolicyRule {
+                    id: "hidden".into(),
+                    phase: PolicyPhase::Discovery,
+                    priority: 2,
+                    effect: PolicyEffect::Allow,
+                    all: vec![Condition {
+                        field: "tenant.id".into(),
+                        equals: "a".into(),
+                    }],
+                },
+            ],
+        };
+        assert_eq!(
+            compile(unreachable).unwrap_err(),
+            PolicyCompileError::UnreachableRule("hidden".into())
+        );
     }
 }

@@ -1,28 +1,33 @@
 use std::{collections::BTreeMap, sync::Arc};
 
+use crate::outbound::UpstreamRuntime;
 use anyhow::{Context, Result};
 use gaugemesh_core::{
     capability::CapabilityId,
+    config::CapabilityMode,
     context::{
         CapabilityScope, MoneyBudgetMicros, PrincipalId, RetryBudget, TenantId, TokenBudget,
     },
-    federation::{FederatedTool, Federation},
+    digest::Sha256Digest,
+    federation::{CompositeCursor, FederatedTool, Federation, open_cursor, seal_cursor},
     lease::{CapabilityLease, LeaseError},
+    storage::{LeaseStorage, MemoryStorage},
 };
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, model::*, service::RequestContext};
 use serde_json::{Map, Value, json};
-use tokio::sync::Mutex;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct MeshMcpServer {
     state: Arc<MeshMcpState>,
 }
 
-#[derive(Debug)]
 struct MeshMcpState {
     federation: Federation,
-    leases: Mutex<BTreeMap<String, CapabilityLease>>,
+    leases: Arc<dyn LeaseStorage>,
     started: std::time::Instant,
+    upstreams: Option<Arc<UpstreamRuntime>>,
+    capability_mode: CapabilityMode,
+    cursor_key: [u8; 32],
 }
 
 impl MeshMcpServer {
@@ -30,8 +35,29 @@ impl MeshMcpServer {
         Self {
             state: Arc::new(MeshMcpState {
                 federation: Federation::demo(),
-                leases: Mutex::new(BTreeMap::new()),
+                leases: Arc::new(MemoryStorage::default()),
                 started: std::time::Instant::now(),
+                upstreams: None,
+                capability_mode: CapabilityMode::Transparent,
+                cursor_key: *Sha256Digest::of_bytes(uuid::Uuid::new_v4().as_bytes()).as_bytes(),
+            }),
+        }
+    }
+
+    pub fn configured(
+        federation: Federation,
+        upstreams: Option<Arc<UpstreamRuntime>>,
+        leases: Arc<dyn LeaseStorage>,
+        capability_mode: CapabilityMode,
+    ) -> Self {
+        Self {
+            state: Arc::new(MeshMcpState {
+                federation,
+                leases,
+                started: std::time::Instant::now(),
+                upstreams,
+                capability_mode,
+                cursor_key: *Sha256Digest::of_bytes(uuid::Uuid::new_v4().as_bytes()).as_bytes(),
             }),
         }
     }
@@ -51,6 +77,107 @@ impl MeshMcpServer {
             "query": query,
             "value": tool.fixture_result,
         }))
+    }
+
+    fn discovery_meta(&self) -> Option<MetaObject> {
+        let incomplete = self
+            .state
+            .upstreams
+            .as_ref()
+            .map(|upstreams| upstreams.incomplete_sources())
+            .unwrap_or_default();
+        if incomplete.is_empty() {
+            None
+        } else {
+            Some(MetaObject(
+                serde_json::from_value(json!({
+                    "dev.gaugemesh/discovery": {
+                        "complete": false,
+                        "unavailableSources": incomplete,
+                    }
+                }))
+                .expect("discovery metadata is an object"),
+            ))
+        }
+    }
+
+    fn page<T: Clone + serde::Serialize>(
+        &self,
+        kind: &str,
+        items: Vec<T>,
+        request: Option<PaginatedRequestParams>,
+    ) -> Result<(Vec<T>, Option<String>), McpError> {
+        const PAGE_SIZE: usize = 128;
+        let snapshot_digest = Sha256Digest::of_json(
+            &serde_json::to_value(&items)
+                .map_err(|_| McpError::internal_error("GM_CURSOR_SNAPSHOT", None))?,
+        );
+        let start = if let Some(cursor) = request.and_then(|request| request.cursor) {
+            let cursor = open_cursor(&cursor, &self.state.cursor_key)
+                .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+            if cursor.snapshot_digest != snapshot_digest || cursor.source_positions.len() != 1 {
+                return Err(McpError::invalid_params("GM_CURSOR_STALE", None));
+            }
+            cursor
+                .source_positions
+                .get(kind)
+                .and_then(|position| position.parse::<usize>().ok())
+                .filter(|position| *position <= items.len())
+                .ok_or_else(|| McpError::invalid_params("GM_CURSOR_INVALID", None))?
+        } else {
+            0
+        };
+        let end = start.saturating_add(PAGE_SIZE).min(items.len());
+        let page = items[start..end].to_vec();
+        let next = if end < items.len() {
+            Some(
+                seal_cursor(
+                    &CompositeCursor {
+                        source_positions: BTreeMap::from([(kind.into(), end.to_string())]),
+                        snapshot_digest,
+                    },
+                    &self.state.cursor_key,
+                )
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?,
+            )
+        } else {
+            None
+        };
+        Ok((page, next))
+    }
+
+    async fn invoke_tool(
+        &self,
+        tool: &FederatedTool,
+        arguments: Option<Map<String, Value>>,
+    ) -> Result<CallToolResponse, McpError> {
+        let Some(upstreams) = &self.state.upstreams else {
+            return Ok(Self::tool_result(tool, arguments.as_ref()).into());
+        };
+        if !upstreams.contains_source(&tool.identity.source) {
+            return Err(McpError::internal_error(
+                "GM_MCP_UPSTREAM_SOURCE_UNAVAILABLE",
+                None,
+            ));
+        }
+        let mut request = CallToolRequestParams::new(tool.native_name.clone());
+        request.arguments = arguments;
+        let mut response = upstreams
+            .call_tool(&tool.identity.source, request)
+            .await
+            .map_err(|error| {
+                McpError::internal_error(format!("GM_MCP_UPSTREAM_CALL:{error}"), None)
+            })?;
+        if let CallToolResponse::Complete(result) = &mut response {
+            bind_result_meta(
+                &mut result.meta,
+                &tool.identity,
+                result.result_type.as_ref(),
+                None,
+                None,
+            );
+        }
+        Ok(response)
     }
 
     fn meta_tools() -> Vec<Tool> {
@@ -103,7 +230,7 @@ impl MeshMcpServer {
         &self,
         name: &str,
         arguments: Option<Map<String, Value>>,
-    ) -> CallToolResult {
+    ) -> Result<CallToolResponse, McpError> {
         let arguments = arguments.unwrap_or_default();
         match name {
             "gaugemesh_search" => {
@@ -116,20 +243,21 @@ impl MeshMcpServer {
                     .into_iter()
                     .map(|tool| json!({"alias":tool.alias,"capabilityId":tool.identity.digest().to_string(),"source":tool.identity.source.0,"description":tool.description}))
                     .collect::<Vec<_>>();
-                CallToolResult::structured(json!({"results": results}))
+                Ok(CallToolResult::structured(json!({"results": results})).into())
             }
             "gaugemesh_describe" => {
                 let alias = arguments.get("alias").and_then(Value::as_str).unwrap_or("");
                 match self.state.federation.tool(alias) {
-                    Ok(tool) => CallToolResult::structured(json!({
+                    Ok(tool) => Ok(CallToolResult::structured(json!({
                         "alias": tool.alias,
                         "capabilityId": tool.identity.digest().to_string(),
                         "schemaDigest": tool.identity.schema_digest.to_string(),
                         "source": tool.identity.source.0,
                         "sideEffect": tool.side_effect,
                         "inputSchema": tool.input_schema,
-                    })),
-                    Err(error) => tool_error(error.to_string()),
+                    }))
+                    .into()),
+                    Err(error) => Ok(tool_error(error.to_string()).into()),
                 }
             }
             "gaugemesh_lease" => {
@@ -145,7 +273,7 @@ impl MeshMcpServer {
                     .map(|tool| tool.identity.clone())
                     .collect::<Vec<_>>();
                 if capabilities.len() != aliases.len() || capabilities.is_empty() {
-                    return tool_error("GM_LEASE_CAPABILITY_OUTSIDE_CONE");
+                    return Ok(tool_error("GM_LEASE_CAPABILITY_OUTSIDE_CONE").into());
                 }
                 let ttl_ms = arguments
                     .get("ttlMs")
@@ -163,17 +291,15 @@ impl MeshMcpServer {
                     TokenBudget(4_096),
                     RetryBudget(1),
                 );
-                self.state
-                    .leases
-                    .lock()
-                    .await
-                    .insert(lease.id.0.clone(), lease.clone());
-                CallToolResult::structured(json!({
+                if self.state.leases.put(&lease).is_err() {
+                    return Ok(tool_error("GM_STORAGE_WRITE").into());
+                }
+                Ok(CallToolResult::structured(json!({
                     "leaseId": lease.id.0,
                     "manifestDigest": lease.manifest_digest.to_string(),
                     "expiresInMs": ttl_ms,
                     "capabilities": lease.capabilities.iter().map(CapabilityId::digest).map(|digest| digest.to_string()).collect::<Vec<_>>(),
-                }))
+                })).into())
             }
             "gaugemesh_invoke" => {
                 let lease_id = arguments
@@ -184,16 +310,27 @@ impl MeshMcpServer {
                 let tool_arguments = arguments.get("arguments").and_then(Value::as_object);
                 let tool = match self.state.federation.tool(alias) {
                     Ok(tool) => tool,
-                    Err(error) => return tool_error(error.to_string()),
+                    Err(error) => return Ok(tool_error(error.to_string()).into()),
                 };
-                let leases = self.state.leases.lock().await;
-                let Some(lease) = leases.get(lease_id) else {
-                    return tool_error("GM_LEASE_CAPABILITY_OUTSIDE_CONE");
+                let Some(lease) = self
+                    .state
+                    .leases
+                    .get(lease_id)
+                    .map_err(|_| McpError::internal_error("GM_STORAGE_READ", None))?
+                else {
+                    return Ok(tool_error("GM_LEASE_CAPABILITY_OUTSIDE_CONE").into());
                 };
                 let now = self.state.started.elapsed().as_millis() as u64;
-                match lease.authorize(&local_principal(), &local_tenant(), &tool.identity, now) {
-                    Ok(()) => Self::tool_result(tool, tool_arguments),
-                    Err(error) => tool_error(lease_error_code(error)),
+                let authorization = lease.authorize_invocation(
+                    &local_principal(),
+                    &local_tenant(),
+                    &tool.identity,
+                    tool.side_effect,
+                    now,
+                );
+                match authorization {
+                    Ok(()) => self.invoke_tool(tool, tool_arguments.cloned()).await,
+                    Err(error) => Ok(tool_error(lease_error_code(error)).into()),
                 }
             }
             "gaugemesh_release" => {
@@ -201,10 +338,19 @@ impl MeshMcpServer {
                     .get("leaseId")
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                let released = self.state.leases.lock().await.remove(lease_id).is_some();
-                CallToolResult::structured(json!({"released": released}))
+                let released = self
+                    .state
+                    .leases
+                    .get(lease_id)
+                    .map_err(|_| McpError::internal_error("GM_STORAGE_READ", None))?
+                    .is_some();
+                self.state
+                    .leases
+                    .remove(lease_id)
+                    .map_err(|_| McpError::internal_error("GM_STORAGE_WRITE", None))?;
+                Ok(CallToolResult::structured(json!({"released": released})).into())
             }
-            _ => tool_error("GM_CAPABILITY_NOT_FOUND"),
+            _ => Ok(tool_error("GM_CAPABILITY_NOT_FOUND").into()),
         }
     }
 }
@@ -225,14 +371,22 @@ impl ServerHandler for MeshMcpServer {
 
     async fn list_tools(
         &self,
-        _request: Option<PaginatedRequestParams>,
+        request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        let mut tools = self.state.federation.rmcp_tools();
+        let mut tools = if self.state.capability_mode == CapabilityMode::Transparent {
+            self.state.federation.rmcp_tools()
+        } else {
+            Vec::new()
+        };
         tools.extend(Self::meta_tools());
-        Ok(ListToolsResult::with_all_items(tools)
+        let (tools, next_cursor) = self.page("tools", tools, request)?;
+        let mut result = ListToolsResult::with_all_items(tools)
             .with_ttl_ms(5_000)
-            .with_cache_scope(CacheScope::Private))
+            .with_cache_scope(CacheScope::Private);
+        result.meta = self.discovery_meta();
+        result.next_cursor = next_cursor;
+        Ok(result)
     }
 
     async fn call_tool(
@@ -241,40 +395,76 @@ impl ServerHandler for MeshMcpServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         if request.name.starts_with("gaugemesh_") {
-            return Ok(self
-                .call_meta_tool(&request.name, request.arguments)
-                .await
-                .into());
+            return self.call_meta_tool(&request.name, request.arguments).await;
         }
-        Ok(match self.state.federation.tool(&request.name) {
-            Ok(tool) => Self::tool_result(tool, request.arguments.as_ref()),
-            Err(error) => tool_error(error.to_string()),
+        if self.state.capability_mode == CapabilityMode::Lease {
+            return Err(McpError::invalid_request(
+                "GM_CAPABILITY_LEASE_REQUIRED",
+                None,
+            ));
         }
-        .into())
+        let tool = self
+            .state
+            .federation
+            .tool(&request.name)
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?
+            .clone();
+        if let Some(upstreams) = &self.state.upstreams {
+            if upstreams.contains_source(&tool.identity.source) {
+                let mut upstream_request = request;
+                upstream_request.name = tool.native_name.clone().into();
+                let mut response = upstreams
+                    .call_tool(&tool.identity.source, upstream_request)
+                    .await
+                    .map_err(|error| {
+                        McpError::internal_error(format!("GM_MCP_UPSTREAM_CALL:{error}"), None)
+                    })?;
+                if let CallToolResponse::Complete(result) = &mut response {
+                    bind_result_meta(
+                        &mut result.meta,
+                        &tool.identity,
+                        result.result_type.as_ref(),
+                        None,
+                        None,
+                    );
+                }
+                return Ok(response);
+            }
+        }
+        Ok(Self::tool_result(&tool, request.arguments.as_ref()).into())
     }
 
     async fn list_resources(
         &self,
-        _request: Option<PaginatedRequestParams>,
+        request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
-        Ok(
-            ListResourcesResult::with_all_items(self.state.federation.rmcp_resources())
-                .with_ttl_ms(5_000)
-                .with_cache_scope(CacheScope::Private),
-        )
+        let (resources, next_cursor) =
+            self.page("resources", self.state.federation.rmcp_resources(), request)?;
+        let mut result = ListResourcesResult::with_all_items(resources)
+            .with_ttl_ms(5_000)
+            .with_cache_scope(CacheScope::Private);
+        result.meta = self.discovery_meta();
+        result.next_cursor = next_cursor;
+        Ok(result)
     }
 
     async fn list_resource_templates(
         &self,
-        _request: Option<PaginatedRequestParams>,
+        request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourceTemplatesResult, McpError> {
-        Ok(
-            ListResourceTemplatesResult::with_all_items(self.state.federation.rmcp_templates())
-                .with_ttl_ms(5_000)
-                .with_cache_scope(CacheScope::Private),
-        )
+        let (templates, next_cursor) = self.page(
+            "resource_templates",
+            self.state.federation.rmcp_templates(),
+            request,
+        )?;
+        let mut result = ListResourceTemplatesResult::with_all_items(templates)
+            .with_ttl_ms(5_000)
+            .with_cache_scope(CacheScope::Private);
+        result.meta = self.discovery_meta();
+        result.next_cursor = next_cursor;
+        Ok(result)
     }
 
     async fn read_resource(
@@ -282,6 +472,38 @@ impl ServerHandler for MeshMcpServer {
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, McpError> {
+        if let Some(upstreams) = &self.state.upstreams {
+            if let Ok(resource) = self.state.federation.resource(&request.uri) {
+                let resource = resource.clone();
+                let virtual_uri = request.uri.clone();
+                let mut upstream_request = request;
+                upstream_request.uri = resource.native_uri.clone();
+                let mut response = upstreams
+                    .read_resource(&resource.identity.source, upstream_request)
+                    .await
+                    .map_err(|error| {
+                        McpError::internal_error(format!("GM_MCP_UPSTREAM_READ:{error}"), None)
+                    })?;
+                virtualize_resource_response(&mut response, &virtual_uri, &resource.identity);
+                return Ok(response);
+            }
+            if let Some((template, native_uri)) =
+                self.state.federation.resolve_template(&request.uri)
+            {
+                let template = template.clone();
+                let virtual_uri = request.uri.clone();
+                let mut upstream_request = request;
+                upstream_request.uri = native_uri;
+                let mut response = upstreams
+                    .read_resource(&template.identity.source, upstream_request)
+                    .await
+                    .map_err(|error| {
+                        McpError::internal_error(format!("GM_MCP_UPSTREAM_READ:{error}"), None)
+                    })?;
+                virtualize_resource_response(&mut response, &virtual_uri, &template.identity);
+                return Ok(response);
+            }
+        }
         let resource = self
             .state
             .federation
@@ -298,14 +520,17 @@ impl ServerHandler for MeshMcpServer {
 
     async fn list_prompts(
         &self,
-        _request: Option<PaginatedRequestParams>,
+        request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListPromptsResult, McpError> {
-        Ok(
-            ListPromptsResult::with_all_items(self.state.federation.rmcp_prompts())
-                .with_ttl_ms(5_000)
-                .with_cache_scope(CacheScope::Private),
-        )
+        let (prompts, next_cursor) =
+            self.page("prompts", self.state.federation.rmcp_prompts(), request)?;
+        let mut result = ListPromptsResult::with_all_items(prompts)
+            .with_ttl_ms(5_000)
+            .with_cache_scope(CacheScope::Private);
+        result.meta = self.discovery_meta();
+        result.next_cursor = next_cursor;
+        Ok(result)
     }
 
     async fn get_prompt(
@@ -317,7 +542,30 @@ impl ServerHandler for MeshMcpServer {
             .state
             .federation
             .prompt(&request.name)
-            .map_err(|_| McpError::invalid_params("GM_PROMPT_NOT_FOUND", None))?;
+            .map_err(|_| McpError::invalid_params("GM_PROMPT_NOT_FOUND", None))?
+            .clone();
+        if let Some(upstreams) = &self.state.upstreams {
+            if upstreams.contains_source(&prompt.identity.source) {
+                let mut upstream_request = request;
+                upstream_request.name = prompt.native_name.clone();
+                let mut response = upstreams
+                    .get_prompt(&prompt.identity.source, upstream_request)
+                    .await
+                    .map_err(|error| {
+                        McpError::internal_error(format!("GM_MCP_UPSTREAM_PROMPT:{error}"), None)
+                    })?;
+                if let GetPromptResponse::Complete(result) = &mut response {
+                    bind_result_meta(
+                        &mut result.meta,
+                        &prompt.identity,
+                        result.result_type.as_ref(),
+                        None,
+                        None,
+                    );
+                }
+                return Ok(response);
+            }
+        }
         let mut rendered = prompt.template.clone();
         for argument in &prompt.arguments {
             let value = request
@@ -333,6 +581,55 @@ impl ServerHandler for MeshMcpServer {
                 .with_description(&prompt.description)
                 .into(),
         )
+    }
+}
+
+fn bind_result_meta(
+    meta: &mut Option<MetaObject>,
+    identity: &CapabilityId,
+    result_type: Option<&ResultType>,
+    ttl_ms: Option<u64>,
+    cache_scope: Option<&CacheScope>,
+) {
+    let map = &mut meta.get_or_insert_with(|| MetaObject(Map::new())).0;
+    map.insert(
+        "dev.gaugemesh/conservation".into(),
+        json!({
+            "capabilityId": identity.digest().to_string(),
+            "source": identity.source.0,
+            "schemaDigest": identity.schema_digest.to_string(),
+            "resultTypePreserved": result_type.is_some(),
+            "ttlMsPreserved": ttl_ms.is_some(),
+            "cacheScopePreserved": cache_scope.is_some(),
+            "requiredSemanticLosses": [],
+        }),
+    );
+}
+
+fn virtualize_resource_response(
+    response: &mut ReadResourceResponse,
+    virtual_uri: &str,
+    identity: &CapabilityId,
+) {
+    if let ReadResourceResponse::Complete(result) = response {
+        for contents in &mut result.contents {
+            match contents {
+                ResourceContents::TextResourceContents { uri, .. }
+                | ResourceContents::BlobResourceContents { uri, .. } => {
+                    *uri = virtual_uri.to_owned();
+                }
+                _ => {}
+            }
+        }
+        let result_type = result.result_type.clone();
+        let cache_scope = result.cache_scope;
+        bind_result_meta(
+            &mut result.meta,
+            identity,
+            result_type.as_ref(),
+            result.ttl_ms,
+            cache_scope.as_ref(),
+        );
     }
 }
 
@@ -359,9 +656,9 @@ fn lease_error_code(error: LeaseError) -> &'static str {
     }
 }
 
-pub async fn serve_stdio() -> Result<()> {
+pub async fn serve_stdio_server(server: MeshMcpServer) -> Result<()> {
     use rmcp::ServiceExt as _;
-    let service = MeshMcpServer::demo()
+    let service = server
         .serve(rmcp::transport::stdio())
         .await
         .context("failed to start MCP stdio transport")?;
@@ -417,6 +714,74 @@ mod tests {
         assert!(tools.iter().any(|tool| tool.name == "docs-b__search"));
         assert_eq!(client.list_all_resources().await.unwrap().len(), 2);
         assert_eq!(client.list_all_prompts().await.unwrap().len(), 2);
+        client.cancel().await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn compressed_mode_requires_and_enforces_a_capability_lease() {
+        let (client_side, server_side) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            MeshMcpServer::configured(
+                Federation::demo(),
+                None,
+                Arc::new(MemoryStorage::default()),
+                CapabilityMode::Lease,
+            )
+            .serve(server_side)
+            .await
+            .unwrap()
+            .waiting()
+            .await
+            .unwrap();
+        });
+        let client = TestClient.serve(client_side).await.unwrap();
+        let tools = client.list_all_tools().await.unwrap();
+        assert!(tools.iter().any(|tool| tool.name == "gaugemesh_lease"));
+        assert!(!tools.iter().any(|tool| tool.name == "docs-a__search"));
+        let direct = client
+            .call_tool_once(CallToolRequestParams::new("docs-a__search"))
+            .await;
+        assert!(
+            direct
+                .unwrap_err()
+                .to_string()
+                .contains("GM_CAPABILITY_LEASE_REQUIRED")
+        );
+
+        let lease_response = client
+            .call_tool_once(
+                CallToolRequestParams::new("gaugemesh_lease").with_arguments(
+                    json!({"aliases":["docs-a__search"]})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        let mut lease_id = None;
+        if let CallToolResponse::Complete(result) = lease_response {
+            lease_id = result
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.get("leaseId"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+        }
+        let lease_id = lease_id.expect("lease response contains an id");
+        let invocation = client
+            .call_tool_once(
+                CallToolRequestParams::new("gaugemesh_invoke").with_arguments(
+                    json!({"leaseId":lease_id,"alias":"docs-a__search","arguments":{"query":"bounded"}})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(invocation, CallToolResponse::Complete(_)));
         client.cancel().await.unwrap();
         server.await.unwrap();
     }

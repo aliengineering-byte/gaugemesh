@@ -32,6 +32,12 @@ pub enum InvariantId {
     Schema,
     TraceParent,
     DataProvenance,
+    Delegation,
+    CausalObservations,
+    RouteDecisions,
+    PolicyDecisions,
+    RetryAttempts,
+    BudgetDebits,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -159,6 +165,70 @@ pub fn conserve(source: &RequestContext, target: &RequestContext) -> Conservatio
         InvariantId::DataProvenance,
         InvariantErrorCode::CausalityBroken
     );
+    if source.capability == target.capability {
+        preserved.push(InvariantId::Capability);
+    } else {
+        violations.push(InvariantViolation {
+            invariant: InvariantId::Capability,
+            code: InvariantErrorCode::SchemaUnbound,
+            detail: "capability identity changed across the adapter boundary".into(),
+        });
+    }
+
+    append_only(
+        &source.delegation.0,
+        &target.delegation.0,
+        InvariantId::Delegation,
+        InvariantErrorCode::CausalityBroken,
+        &mut preserved,
+        &mut strengthened,
+        &mut violations,
+    );
+    append_only(
+        &source.causal_observations,
+        &target.causal_observations,
+        InvariantId::CausalObservations,
+        InvariantErrorCode::CausalityBroken,
+        &mut preserved,
+        &mut strengthened,
+        &mut violations,
+    );
+    append_only(
+        &source.route_decisions,
+        &target.route_decisions,
+        InvariantId::RouteDecisions,
+        InvariantErrorCode::CausalityBroken,
+        &mut preserved,
+        &mut strengthened,
+        &mut violations,
+    );
+    append_only(
+        &source.policy_decisions,
+        &target.policy_decisions,
+        InvariantId::PolicyDecisions,
+        InvariantErrorCode::CausalityBroken,
+        &mut preserved,
+        &mut strengthened,
+        &mut violations,
+    );
+    append_only(
+        &source.retry_attempts,
+        &target.retry_attempts,
+        InvariantId::RetryAttempts,
+        InvariantErrorCode::RetryAmplified,
+        &mut preserved,
+        &mut strengthened,
+        &mut violations,
+    );
+    append_only(
+        &source.budget_debits,
+        &target.budget_debits,
+        InvariantId::BudgetDebits,
+        InvariantErrorCode::BudgetIncreased,
+        &mut preserved,
+        &mut strengthened,
+        &mut violations,
+    );
 
     monotone(
         target.scope.is_subset_of(&source.scope),
@@ -227,6 +297,29 @@ pub fn conserve(source: &RequestContext, target: &RequestContext) -> Conservatio
 }
 
 #[allow(clippy::too_many_arguments)]
+fn append_only<T: PartialEq>(
+    source: &[T],
+    target: &[T],
+    id: InvariantId,
+    code: InvariantErrorCode,
+    preserved: &mut Vec<InvariantId>,
+    strengthened: &mut Vec<InvariantId>,
+    violations: &mut Vec<InvariantViolation>,
+) {
+    if target == source {
+        preserved.push(id);
+    } else if target.starts_with(source) {
+        strengthened.push(id);
+    } else {
+        violations.push(InvariantViolation {
+            invariant: id,
+            code,
+            detail: format!("{id:?} is not append-only"),
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn monotone(
     valid: bool,
     equal: bool,
@@ -282,5 +375,19 @@ mod tests {
         let mut target = source.clone();
         target.data_classification = DataClassification::Public;
         assert!(!conserve(&source, &target).passed());
+    }
+
+    #[test]
+    fn decision_ledgers_are_append_only() {
+        let source = RequestContext::local_fixture();
+        let mut target = source.clone();
+        target
+            .route_decisions
+            .push(Sha256Digest::of_bytes("route-a"));
+        assert!(conserve(&source, &target).passed());
+
+        let mut rewritten = target.clone();
+        rewritten.route_decisions[0] = Sha256Digest::of_bytes("route-b");
+        assert!(!conserve(&target, &rewritten).passed());
     }
 }

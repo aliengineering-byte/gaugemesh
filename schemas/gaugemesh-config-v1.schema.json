@@ -1,0 +1,485 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Config",
+  "type": "object",
+  "properties": {
+    "capability_mode": {
+      "$ref": "#/$defs/CapabilityMode",
+      "default": "transparent"
+    },
+    "discovery_mode": {
+      "$ref": "#/$defs/DiscoveryMode",
+      "default": "strict"
+    },
+    "listeners": {
+      "$ref": "#/$defs/ListenerConfig"
+    },
+    "mcp_sources": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/McpSourceConfig"
+      }
+    },
+    "models": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/ModelConfig"
+      }
+    },
+    "policy": {
+      "$ref": "#/$defs/PolicyDocument"
+    },
+    "routing": {
+      "$ref": "#/$defs/RoutingConfig"
+    },
+    "runtime": {
+      "$ref": "#/$defs/RuntimeConfig"
+    },
+    "version": {
+      "type": "integer",
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "runtime",
+    "listeners",
+    "routing",
+    "policy"
+  ],
+  "$defs": {
+    "CapabilityMode": {
+      "type": "string",
+      "enum": [
+        "transparent",
+        "lease"
+      ]
+    },
+    "Condition": {
+      "type": "object",
+      "properties": {
+        "equals": {
+          "type": "string"
+        },
+        "field": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "field",
+        "equals"
+      ]
+    },
+    "DiscoveryMode": {
+      "type": "string",
+      "enum": [
+        "strict",
+        "degraded"
+      ]
+    },
+    "ListenerConfig": {
+      "type": "object",
+      "properties": {
+        "admin_address": {
+          "type": "string"
+        },
+        "data_address": {
+          "type": "string"
+        },
+        "remote": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RemoteConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "data_address",
+        "admin_address"
+      ]
+    },
+    "McpSourceConfig": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "protocol_revision": {
+          "type": "string"
+        },
+        "reviewed": {
+          "type": "boolean"
+        },
+        "sharing": {
+          "$ref": "#/$defs/SharingClass"
+        },
+        "transport": {
+          "$ref": "#/$defs/McpTransportConfig"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "transport",
+        "protocol_revision",
+        "sharing",
+        "reviewed"
+      ]
+    },
+    "McpTransportConfig": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "args": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "command": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "stdio"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "command",
+            "args"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "streamable_http"
+            },
+            "url": {
+              "type": "string",
+              "format": "uri"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "url"
+          ]
+        }
+      ]
+    },
+    "ModelConfig": {
+      "type": "object",
+      "properties": {
+        "base_url": {
+          "type": "string",
+          "format": "uri"
+        },
+        "context_limit": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "cost_table": {
+          "$ref": "#/$defs/ModelCostConfig"
+        },
+        "credential_env": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "id": {
+          "type": "string"
+        },
+        "max_output_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "provider_model_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "base_url",
+        "provider_model_id",
+        "context_limit",
+        "max_output_tokens",
+        "cost_table"
+      ]
+    },
+    "ModelCostConfig": {
+      "type": "object",
+      "properties": {
+        "input_micros_per_million_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "output_micros_per_million_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "input_micros_per_million_tokens",
+        "output_micros_per_million_tokens"
+      ]
+    },
+    "PolicyDocument": {
+      "type": "object",
+      "properties": {
+        "default": {
+          "$ref": "#/$defs/PolicyEffect"
+        },
+        "rules": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PolicyRule"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "default",
+        "rules"
+      ]
+    },
+    "PolicyEffect": {
+      "type": "string",
+      "enum": [
+        "allow",
+        "deny"
+      ]
+    },
+    "PolicyPhase": {
+      "type": "string",
+      "enum": [
+        "discovery",
+        "request_metadata",
+        "request_body",
+        "response_metadata",
+        "response_body",
+        "post_effect",
+        "cleanup"
+      ]
+    },
+    "PolicyRule": {
+      "type": "object",
+      "properties": {
+        "all": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Condition"
+          }
+        },
+        "effect": {
+          "$ref": "#/$defs/PolicyEffect"
+        },
+        "id": {
+          "type": "string"
+        },
+        "phase": {
+          "$ref": "#/$defs/PolicyPhase"
+        },
+        "priority": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "phase",
+        "priority",
+        "effect"
+      ]
+    },
+    "RemoteConfig": {
+      "type": "object",
+      "properties": {
+        "audience": {
+          "type": "string"
+        },
+        "issuer": {
+          "type": "string",
+          "format": "uri"
+        },
+        "public_origin": {
+          "type": "string",
+          "format": "uri"
+        },
+        "tls_certificate": {
+          "type": "string"
+        },
+        "tls_private_key": {
+          "type": "string"
+        },
+        "trusted_proxies": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string",
+            "format": "ip"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "tls_certificate",
+        "tls_private_key",
+        "public_origin",
+        "issuer",
+        "audience"
+      ]
+    },
+    "RouteWeights": {
+      "type": "object",
+      "properties": {
+        "cost": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "exposure": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "failure": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "latency": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "pressure": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "semantic_loss": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "switching": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "latency",
+        "cost",
+        "failure",
+        "semantic_loss",
+        "pressure",
+        "exposure",
+        "switching"
+      ]
+    },
+    "RoutingConfig": {
+      "type": "object",
+      "properties": {
+        "max_concurrent_per_tenant": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "max_queue_per_tenant": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "weights": {
+          "$ref": "#/$defs/RouteWeights"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "weights",
+        "max_queue_per_tenant",
+        "max_concurrent_per_tenant"
+      ]
+    },
+    "RuntimeConfig": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "const": "memory"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "mode"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "database": {
+              "type": "string"
+            },
+            "mode": {
+              "type": "string",
+              "const": "sqlite"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "mode",
+            "database"
+          ]
+        }
+      ]
+    },
+    "SharingClass": {
+      "type": "string",
+      "enum": [
+        "shareable_stateless",
+        "shareable_with_serialization",
+        "principal_isolated",
+        "tenant_isolated",
+        "non_shareable"
+      ]
+    }
+  }
+}

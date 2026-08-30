@@ -50,5 +50,21 @@ pub fn debit(context: &RequestContext, debit: BudgetDebit) -> Result<RequestCont
         .0
         .checked_sub(debit.elapsed_ms)
         .ok_or(BudgetError::Deadline)?;
+    let debit_digest = crate::digest::Sha256Digest::of_json(&serde_json::json!({
+        "moneyMicros": debit.money_micros,
+        "tokens": debit.tokens,
+        "retries": debit.retries,
+        "elapsedMs": debit.elapsed_ms,
+        "ordinal": output.budget_debits.len(),
+    }));
+    output.budget_debits.push(debit_digest);
+    for retry in 0..debit.retries {
+        output
+            .retry_attempts
+            .push(crate::digest::Sha256Digest::of_json(&serde_json::json!({
+                "debit": debit_digest,
+                "retry": retry,
+            })));
+    }
     Ok(output)
 }
