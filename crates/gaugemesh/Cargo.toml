@@ -17,6 +17,8 @@ axum.workspace = true
 clap.workspace = true
 gaugemesh-core = { path = "../gaugemesh-core" }
 reqwest.workspace = true
+rmcp.workspace = true
+schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
@@ -24,4 +26,4 @@ tokio.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-
+url.workspace = true
