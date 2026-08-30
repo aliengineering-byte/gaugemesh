@@ -13,6 +13,7 @@ use gaugemesh_core::{
 };
 
 mod mcp;
+mod model;
 mod outbound;
 
 #[derive(Debug, Parser)]
@@ -96,6 +97,24 @@ enum AddCommand {
     },
     Model {
         id: String,
+        #[arg(long, default_value = "gaugemesh.yaml")]
+        config: PathBuf,
+        #[arg(long)]
+        base_url: url::Url,
+        #[arg(long)]
+        provider_model_id: String,
+        #[arg(long, default_value_t = 128_000)]
+        context_limit: u64,
+        #[arg(long, default_value_t = 4_096)]
+        max_output_tokens: u64,
+        #[arg(long, default_value = "user-v1")]
+        cost_table_version: String,
+        #[arg(long, default_value_t = 0)]
+        input_micros_per_million_tokens: u64,
+        #[arg(long, default_value_t = 0)]
+        output_micros_per_million_tokens: u64,
+        #[arg(long)]
+        credential_env: Option<String>,
     },
 }
 
@@ -205,7 +224,47 @@ async fn add(kind: AddCommand) -> Result<()> {
             );
             Ok(())
         }
-        AddCommand::Model { id } => bail!("GM_FEATURE_NOT_READY:add model {id}"),
+        AddCommand::Model {
+            id,
+            config,
+            base_url,
+            provider_model_id,
+            context_limit,
+            max_output_tokens,
+            cost_table_version,
+            input_micros_per_million_tokens,
+            output_micros_per_million_tokens,
+            credential_env,
+        } => {
+            let identity = model::inspect_openai_provider(
+                base_url.clone(),
+                provider_model_id.clone(),
+                credential_env.as_deref(),
+            )
+            .await?;
+            let contents = std::fs::read_to_string(&config)
+                .with_context(|| format!("GM_CONFIG_READ:{}", config.display()))?;
+            let mut document: Config = serde_yaml::from_str(&contents)
+                .with_context(|| format!("GM_CONFIG_PARSE:{}", config.display()))?;
+            document.models.push(gaugemesh_core::config::ModelConfig {
+                id,
+                base_url,
+                provider_model_id,
+                context_limit,
+                max_output_tokens,
+                cost_table: gaugemesh_core::config::ModelCostConfig {
+                    version: cost_table_version,
+                    input_micros_per_million_tokens,
+                    output_micros_per_million_tokens,
+                },
+                credential_env,
+            });
+            document.validate()?;
+            std::fs::write(&config, serde_yaml::to_string(&document)?)
+                .with_context(|| format!("GM_CONFIG_WRITE:{}", config.display()))?;
+            println!("reviewed OpenAI-compatible model identity {identity}");
+            Ok(())
+        }
     }
 }
 
@@ -295,7 +354,8 @@ async fn serve(data_address: String, admin_address: String) -> Result<()> {
         bail!("GM_CONFIG_UNAUTHENTICATED_NON_LOOPBACK");
     }
     let cancellation = tokio_util::sync::CancellationToken::new();
-    let data = mcp::router(mcp::MeshMcpServer::demo(), cancellation.child_token());
+    let data =
+        mcp::router(mcp::MeshMcpServer::demo(), cancellation.child_token()).merge(model::router());
     let admin = Router::new().route(
         "/healthz",
         get(|| async {
@@ -305,6 +365,7 @@ async fn serve(data_address: String, admin_address: String) -> Result<()> {
     let data_listener = tokio::net::TcpListener::bind(data_address).await?;
     let admin_listener = tokio::net::TcpListener::bind(admin_address).await?;
     println!("MCP endpoint: http://{data_address}/mcp");
+    println!("OpenAI-compatible endpoint: http://{data_address}/v1");
     println!("Admin health: http://{admin_address}/healthz");
     let data_task = axum::serve(data_listener, data).with_graceful_shutdown({
         let cancellation = cancellation.clone();

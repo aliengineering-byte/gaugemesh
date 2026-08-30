@@ -9,6 +9,7 @@ pub mod digest;
 pub mod federation;
 pub mod invariant;
 pub mod lease;
+pub mod model;
 pub mod policy;
 pub mod process_pool;
 pub mod protocol;
