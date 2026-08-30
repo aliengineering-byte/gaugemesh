@@ -132,3 +132,73 @@ fn manifest_digest(
         "scope": scope,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        capability::{CapabilityKind, CapabilityRevision, SourceId},
+        digest::Sha256Digest,
+    };
+
+    fn capability(schema: &str) -> CapabilityId {
+        CapabilityId::new(
+            SourceId("docs".into()),
+            CapabilityKind::Tool,
+            "search",
+            Sha256Digest::of_bytes(schema),
+            CapabilityRevision("2026-07-28".into()),
+            Sha256Digest::of_bytes("source-config"),
+        )
+    }
+
+    fn lease() -> CapabilityLease {
+        CapabilityLease::issue(
+            PrincipalId("alice".into()),
+            TenantId("tenant-a".into()),
+            "request-a".into(),
+            vec![capability("v1")],
+            CapabilityScope::default(),
+            100,
+            MoneyBudgetMicros(10),
+            TokenBudget(20),
+            RetryBudget(1),
+        )
+    }
+
+    #[test]
+    fn stale_schema_and_cross_tenant_use_fail_closed() {
+        let lease = lease();
+        assert_eq!(
+            lease.authorize(
+                &PrincipalId("alice".into()),
+                &TenantId("tenant-a".into()),
+                &capability("v2"),
+                0,
+            ),
+            Err(LeaseError::StaleSchema)
+        );
+        assert_eq!(
+            lease.authorize(
+                &PrincipalId("alice".into()),
+                &TenantId("tenant-b".into()),
+                &capability("v1"),
+                0,
+            ),
+            Err(LeaseError::Tenant)
+        );
+    }
+
+    #[test]
+    fn expiry_uses_monotonic_deadline() {
+        assert_eq!(
+            lease().authorize(
+                &PrincipalId("alice".into()),
+                &TenantId("tenant-a".into()),
+                &capability("v1"),
+                100,
+            ),
+            Err(LeaseError::Expired)
+        );
+    }
+}
