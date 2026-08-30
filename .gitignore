@@ -1,0 +1,10 @@
+/target/
+/.gaugemesh/
+/.resilireplay/
+*.db
+*.db-shm
+*.db-wal
+*.log
+.env
+.DS_Store
+
