@@ -4,7 +4,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::digest::Sha256Digest;
+use crate::{capability::CapabilityId, digest::Sha256Digest};
 
 macro_rules! string_id {
     ($name:ident) => {
@@ -101,7 +101,9 @@ pub struct TokenBudget(pub u64);
 #[serde(transparent)]
 pub struct RetryBudget(pub u16);
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum SideEffectClass {
     ReadOnly,
@@ -152,9 +154,20 @@ pub struct RequestContext {
     pub causal_parent: Option<CausalId>,
     pub trace_parent: String,
     pub protocol: ProtocolIdentity,
+    pub capability: Option<CapabilityId>,
     pub schema_digest: Sha256Digest,
     pub route_policy_digest: Sha256Digest,
     pub data_provenance_digest: Sha256Digest,
+    #[serde(default)]
+    pub causal_observations: Vec<Sha256Digest>,
+    #[serde(default)]
+    pub route_decisions: Vec<Sha256Digest>,
+    #[serde(default)]
+    pub policy_decisions: Vec<Sha256Digest>,
+    #[serde(default)]
+    pub retry_attempts: Vec<Sha256Digest>,
+    #[serde(default)]
+    pub budget_debits: Vec<Sha256Digest>,
 }
 
 impl RequestContext {
@@ -186,9 +199,15 @@ impl RequestContext {
                 revision: ProtocolRevision::InternalV1,
                 peer_digest: zero,
             },
+            capability: None,
             schema_digest: zero,
             route_policy_digest: zero,
             data_provenance_digest: zero,
+            causal_observations: Vec::new(),
+            route_decisions: Vec::new(),
+            policy_decisions: Vec::new(),
+            retry_attempts: Vec::new(),
+            budget_debits: Vec::new(),
         }
     }
 }

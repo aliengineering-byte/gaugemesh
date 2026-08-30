@@ -11,6 +11,7 @@ use axum::{
 };
 use futures_util::stream;
 use gaugemesh_core::{
+    config::ModelConfig,
     context::{
         CapabilityScope, MoneyBudgetMicros, PrincipalId, RetryBudget, TenantId, TokenBudget,
     },
@@ -18,6 +19,7 @@ use gaugemesh_core::{
     federation::Federation,
     lease::CapabilityLease,
     model::{CostTable, ModelBudget, ModelIdentity, ToolMode, enforce_budget},
+    route::{ConstraintResult, RouteCandidate, RouteId, RouteMetricSnapshot, RouteWeights, plan},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -26,25 +28,92 @@ use url::Url;
 const MAX_BODY_BYTES: usize = 256 * 1024;
 const MAX_TOOL_PAYLOAD_BYTES: usize = 16 * 1024;
 const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
+const MAX_PROVIDER_RESPONSE_BYTES: usize = 1024 * 1024;
 const COST_TABLE_VERSION: &str = "fixture-2026-08-30";
 
 #[derive(Clone)]
 pub struct ModelBroker {
-    provider: Arc<dyn ModelProvider>,
+    providers: Arc<Vec<ModelRoute>>,
     federation: Federation,
+}
+
+#[derive(Clone)]
+struct ModelRoute {
+    alias: String,
+    provider: Arc<dyn ModelProvider>,
+    cost_table: CostTable,
+    max_output_tokens: u64,
 }
 
 impl ModelBroker {
     fn fixture() -> Self {
         Self {
-            provider: Arc::new(DeterministicProvider::new()),
+            providers: Arc::new(vec![ModelRoute {
+                alias: "local".into(),
+                provider: Arc::new(DeterministicProvider::new()),
+                cost_table: CostTable {
+                    version: COST_TABLE_VERSION.into(),
+                    input_micros_per_million_tokens: 0,
+                    output_micros_per_million_tokens: 0,
+                },
+                max_output_tokens: 1_024,
+            }]),
             federation: Federation::demo(),
         }
+    }
+
+    fn configured(models: &[ModelConfig], federation: Federation) -> Result<Self> {
+        let providers = models
+            .iter()
+            .map(|model| {
+                let authorization = model
+                    .credential_env
+                    .as_deref()
+                    .map(|name| {
+                        let value = std::env::var(name)
+                            .with_context(|| "GM_MODEL_CREDENTIAL_ENV_MISSING")?;
+                        HeaderValue::from_str(&format!("Bearer {value}"))
+                            .context("GM_MODEL_CREDENTIAL_INVALID")
+                    })
+                    .transpose()?;
+                let provider = OpenAiCompatibleProvider::configured(model, authorization)?;
+                Ok(ModelRoute {
+                    alias: model.id.clone(),
+                    provider: Arc::new(provider),
+                    cost_table: CostTable {
+                        version: model.cost_table.version.clone(),
+                        input_micros_per_million_tokens: model
+                            .cost_table
+                            .input_micros_per_million_tokens,
+                        output_micros_per_million_tokens: model
+                            .cost_table
+                            .output_micros_per_million_tokens,
+                    },
+                    max_output_tokens: model.max_output_tokens,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if providers.is_empty() {
+            bail!("GM_MODEL_NO_CONFIGURED_PROVIDER");
+        }
+        Ok(Self {
+            providers: Arc::new(providers),
+            federation,
+        })
     }
 }
 
 pub fn router() -> Router {
-    let broker = ModelBroker::fixture();
+    router_for_broker(ModelBroker::fixture())
+}
+
+pub fn router_from_config(models: &[ModelConfig], federation: Federation) -> Result<Router> {
+    Ok(router_for_broker(ModelBroker::configured(
+        models, federation,
+    )?))
+}
+
+fn router_for_broker(broker: ModelBroker) -> Router {
     Router::new()
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
@@ -202,6 +271,22 @@ impl OpenAiCompatibleProvider {
             authorization,
         })
     }
+
+    fn configured(config: &ModelConfig, authorization: Option<HeaderValue>) -> Result<Self> {
+        let mut provider = Self::new(
+            config.base_url.clone(),
+            config.provider_model_id.clone(),
+            authorization,
+        )?;
+        provider.identity.context_limit = config.context_limit;
+        provider.identity.cost_table_version = config.cost_table.version.clone();
+        provider.identity.policy_digest = Sha256Digest::of_json(&json!({
+            "route": config.id,
+            "provider": config.provider_model_id,
+            "costTable": config.cost_table,
+        }));
+        Ok(provider)
+    }
 }
 
 pub async fn inspect_openai_provider(
@@ -232,7 +317,7 @@ pub async fn inspect_openai_provider(
     if !response.status().is_success() {
         bail!("GM_MODEL_PROVIDER_STATUS:{}", response.status().as_u16());
     }
-    let body: Value = response.json().await.context("GM_MODEL_PROVIDER_JSON")?;
+    let body = bounded_provider_json(response).await?;
     let found = body
         .get("data")
         .and_then(Value::as_array)
@@ -271,7 +356,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
         if !response.status().is_success() {
             bail!("GM_MODEL_PROVIDER_STATUS:{}", response.status().as_u16());
         }
-        let body: Value = response.json().await.context("GM_MODEL_PROVIDER_JSON")?;
+        let body = bounded_provider_json(response).await?;
         let text = body
             .pointer("/choices/0/message/content")
             .and_then(Value::as_str)
@@ -292,21 +377,42 @@ impl ModelProvider for OpenAiCompatibleProvider {
     }
 }
 
+async fn bounded_provider_json(response: reqwest::Response) -> Result<Value> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_PROVIDER_RESPONSE_BYTES as u64)
+    {
+        bail!("GM_MODEL_PROVIDER_RESPONSE_TOO_LARGE");
+    }
+    let bytes = response.bytes().await.context("GM_MODEL_PROVIDER_BODY")?;
+    if bytes.len() > MAX_PROVIDER_RESPONSE_BYTES {
+        bail!("GM_MODEL_PROVIDER_RESPONSE_TOO_LARGE");
+    }
+    serde_json::from_slice(&bytes).context("GM_MODEL_PROVIDER_JSON")
+}
+
 async fn list_models(State(broker): State<ModelBroker>) -> Json<Value> {
-    let identity = broker.provider.identity();
+    let data = broker
+        .providers
+        .iter()
+        .map(|route| {
+            let identity = route.provider.identity();
+            json!({
+                "id": route.alias,
+                "object": "model",
+                "owned_by": identity.provider,
+                "gaugemesh": {
+                    "identity": identity.digest().to_string(),
+                    "providerModelId": identity.provider_model_id,
+                    "capabilities": identity.capability_set,
+                    "costTableVersion": route.cost_table.version,
+                }
+            })
+        })
+        .collect::<Vec<_>>();
     Json(json!({
         "object": "list",
-        "data": [{
-            "id": "local",
-            "object": "model",
-            "owned_by": "gaugemesh-fixture",
-            "gaugemesh": {
-                "identity": identity.digest().to_string(),
-                "providerModelId": identity.provider_model_id,
-                "capabilities": identity.capability_set,
-                "costTableVersion": identity.cost_table_version,
-            }
-        }]
+        "data": data,
     }))
 }
 
@@ -380,6 +486,8 @@ struct Execution {
     route_digest: Sha256Digest,
     estimated_cost_micros: u64,
     tool: Option<ToolExecution>,
+    model_alias: String,
+    cost_table_version: String,
 }
 
 #[derive(Serialize)]
@@ -398,28 +506,104 @@ async fn execute(
     messages: Vec<Message>,
     max_output: u64,
 ) -> Result<Execution> {
-    if model != "local" && model != broker.provider.identity().provider_model_id {
-        bail!("GM_MODEL_NOT_FOUND");
-    }
     let tool_mode = tool_mode(headers)?;
     let estimated_input =
         approximate_tokens(messages.iter().map(|message| message.content.as_str()));
     let budget = request_budget(headers, max_output)?;
-    let cost_table = CostTable {
-        version: COST_TABLE_VERSION.into(),
-        input_micros_per_million_tokens: 0,
-        output_micros_per_million_tokens: 0,
-    };
-    let estimated_cost_micros = enforce_budget(
-        broker.provider.identity(),
-        &cost_table,
-        &budget,
-        estimated_input,
-        max_output,
-        tool_mode,
-    )?;
+    let mut estimated_costs = std::collections::BTreeMap::new();
+    let candidates = broker
+        .providers
+        .iter()
+        .map(|route| {
+            let identity = route.provider.identity();
+            let name_matches =
+                model == "auto" || model == route.alias || model == identity.provider_model_id;
+            let budget_result = if !name_matches {
+                Err(gaugemesh_core::model::ModelRouteError::ModelNotAllowed)
+            } else if max_output > route.max_output_tokens {
+                Err(gaugemesh_core::model::ModelRouteError::OutputTokens)
+            } else {
+                enforce_budget(
+                    identity,
+                    &route.cost_table,
+                    &budget,
+                    estimated_input,
+                    max_output,
+                    tool_mode,
+                )
+            };
+            let mut rejections = Vec::new();
+            match budget_result {
+                Ok(cost) => {
+                    estimated_costs.insert(route.alias.clone(), cost);
+                }
+                Err(error) => rejections.push(error.to_string()),
+            }
+            RouteCandidate {
+                route_id: RouteId(route.alias.clone()),
+                endpoint_id: identity.endpoint_identity.to_string(),
+                hard_constraints: ConstraintResult {
+                    allowed: rejections.is_empty(),
+                    rejections,
+                },
+                metrics: RouteMetricSnapshot {
+                    latency: 0,
+                    cost: u32::try_from(
+                        route
+                            .cost_table
+                            .input_micros_per_million_tokens
+                            .saturating_add(route.cost_table.output_micros_per_million_tokens)
+                            .min(10_000),
+                    )
+                    .expect("bounded cost metric"),
+                    failure: 0,
+                    pressure: 0,
+                    exposure: u32::from(identity.provider != "fixture"),
+                    switching: 0,
+                },
+                semantic_loss: 0,
+            }
+        })
+        .collect::<Vec<_>>();
+    if estimated_costs.is_empty() {
+        let mut rejections = candidates
+            .iter()
+            .flat_map(|candidate| candidate.hard_constraints.rejections.iter().cloned())
+            .collect::<Vec<_>>();
+        rejections.sort();
+        rejections.dedup();
+        bail!(
+            "{}",
+            rejections
+                .first()
+                .map(String::as_str)
+                .unwrap_or("GM_MODEL_NOT_FOUND_OR_BUDGET_REJECTED")
+        );
+    }
+    let route_plan = plan(
+        candidates,
+        RouteWeights {
+            latency: 10,
+            cost: 30,
+            failure: 30,
+            semantic_loss: 1_000,
+            pressure: 20,
+            exposure: 50,
+            switching: 10,
+        },
+    )
+    .map_err(|_| anyhow::anyhow!("GM_MODEL_NOT_FOUND_OR_BUDGET_REJECTED"))?;
+    let selected = broker
+        .providers
+        .iter()
+        .find(|route| route.alias == route_plan.selected.0)
+        .context("GM_MODEL_ROUTE_IDENTITY_LOST")?;
+    let estimated_cost_micros = estimated_costs
+        .get(&selected.alias)
+        .copied()
+        .context("GM_MODEL_ROUTE_BUDGET_LOST")?;
     let request_digest = Sha256Digest::of_json(&json!({
-        "modelIdentity": broker.provider.identity().digest(),
+        "modelIdentity": selected.provider.identity().digest(),
         "messages": messages,
         "maxOutput": max_output,
         "toolMode": tool_mode,
@@ -435,13 +619,14 @@ async fn execute(
     }
     let output = tokio::time::timeout(
         Duration::from_millis(budget.deadline_remaining_ms),
-        broker.provider.complete(&provider_messages, max_output),
+        selected.provider.complete(&provider_messages, max_output),
     )
     .await
     .context("GM_MODEL_PROVIDER_TIMEOUT")??;
     let route_digest = Sha256Digest::of_json(&json!({
-        "model": broker.provider.identity(),
-        "costTable": cost_table,
+        "plan": route_plan,
+        "model": selected.provider.identity(),
+        "costTable": selected.cost_table,
         "estimatedInput": estimated_input,
         "maxOutput": max_output,
         "toolMode": tool_mode,
@@ -452,6 +637,8 @@ async fn execute(
         route_digest,
         estimated_cost_micros,
         tool,
+        model_alias: selected.alias.clone(),
+        cost_table_version: selected.cost_table.version.clone(),
     })
 }
 
@@ -497,7 +684,7 @@ fn maybe_execute_tool(
             TokenBudget(4_096),
             RetryBudget(0),
         );
-        lease.authorize(&principal, &tenant, &tool.identity, 0)?;
+        lease.authorize_invocation(&principal, &tenant, &tool.identity, tool.side_effect, 0)?;
     }
     let result = json!({"query": query, "fixture": tool.fixture_result});
     if serde_json::to_vec(&result)?.len() > MAX_TOOL_OUTPUT_BYTES {
@@ -528,8 +715,8 @@ fn request_budget(headers: &HeaderMap, max_output: u64) -> Result<ModelBudget> {
         .context("GM_MODEL_TOOL_ROUNDS_INVALID")?,
         retry_limit: u16::try_from(header_u64(headers, "x-gaugemesh-retry-limit")?.unwrap_or(0))
             .context("GM_MODEL_RETRY_LIMIT_INVALID")?,
-        provider_allowlist: vec!["fixture".into()],
-        model_allowlist: vec!["gaugemesh-deterministic".into()],
+        provider_allowlist: header_list(headers, "x-gaugemesh-provider-allowlist")?,
+        model_allowlist: header_list(headers, "x-gaugemesh-model-allowlist")?,
     })
     .and_then(|budget| {
         if max_output == 0 {
@@ -537,6 +724,24 @@ fn request_budget(headers: &HeaderMap, max_output: u64) -> Result<ModelBudget> {
         }
         Ok(budget)
     })
+}
+
+fn header_list(headers: &HeaderMap, name: &str) -> Result<Vec<String>> {
+    let Some(value) = headers.get(name) else {
+        return Ok(Vec::new());
+    };
+    let values = value
+        .to_str()
+        .with_context(|| format!("GM_HEADER_INVALID:{name}"))?
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if values.len() > 32 || values.iter().any(|value| value.len() > 128) {
+        bail!("GM_HEADER_INVALID:{name}");
+    }
+    Ok(values)
 }
 
 fn tool_mode(headers: &HeaderMap) -> Result<ToolMode> {
@@ -567,7 +772,7 @@ fn json_chat(execution: Execution) -> Response {
         "id": execution.id,
         "object": "chat.completion",
         "created": 0,
-        "model": "local",
+        "model": execution.model_alias,
         "choices": [{"index":0,"message":{"role":"assistant","content":execution.output.text},"finish_reason":"stop"}],
         "usage": {"prompt_tokens":execution.output.input_tokens,"completion_tokens":execution.output.output_tokens,"total_tokens":execution.output.input_tokens + execution.output.output_tokens},
         "gaugemesh": metadata(&execution),
@@ -580,7 +785,7 @@ fn json_response(execution: Execution) -> Response {
         "id": execution.id,
         "object": "response",
         "created_at": 0,
-        "model": "local",
+        "model": execution.model_alias,
         "status": "completed",
         "output": [{"type":"message","role":"assistant","content":[{"type":"output_text","text":execution.output.text}]}],
         "usage": {"input_tokens":execution.output.input_tokens,"output_tokens":execution.output.output_tokens,"total_tokens":execution.output.input_tokens + execution.output.output_tokens},
@@ -594,7 +799,7 @@ fn stream_chat(execution: Execution) -> Response {
         "id": execution.id,
         "object":"chat.completion.chunk",
         "created":0,
-        "model":"local",
+        "model":execution.model_alias,
         "choices":[{"index":0,"delta":{"content":execution.output.text},"finish_reason":"stop"}]
     });
     sse_response(execution, payload)
@@ -623,7 +828,7 @@ fn sse_response(execution: Execution, payload: Value) -> Response {
 fn metadata(execution: &Execution) -> Value {
     json!({
         "routeDigest": execution.route_digest.to_string(),
-        "costTableVersion": COST_TABLE_VERSION,
+        "costTableVersion": execution.cost_table_version,
         "estimatedCostMicros": execution.estimated_cost_micros,
         "observedCostMicros": execution.output.observed_cost_micros,
         "tool": execution.tool,
@@ -837,7 +1042,7 @@ mod tests {
             .unwrap();
         assert!(inspected.to_string().starts_with("sha256:"));
         let provider =
-            OpenAiCompatibleProvider::new(base_url, "upstream-model".into(), None).unwrap();
+            OpenAiCompatibleProvider::new(base_url.clone(), "upstream-model".into(), None).unwrap();
         let output = provider
             .complete(
                 &[Message {
@@ -850,6 +1055,46 @@ mod tests {
             .unwrap();
         assert_eq!(output.text, "from upstream");
         assert_eq!(output.input_tokens, 3);
+
+        let configured = router_from_config(
+            &[ModelConfig {
+                id: "reviewed-local".into(),
+                base_url,
+                provider_model_id: "upstream-model".into(),
+                context_limit: 8_192,
+                max_output_tokens: 256,
+                cost_table: gaugemesh_core::config::ModelCostConfig {
+                    version: "test-v1".into(),
+                    input_micros_per_million_tokens: 0,
+                    output_micros_per_million_tokens: 0,
+                },
+                credential_env: None,
+            }],
+            Federation::demo(),
+        )
+        .unwrap();
+        let response = configured
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"model":"reviewed-local","messages":[{"role":"user","content":"configured"}]})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body(response)
+                .await
+                .pointer("/choices/0/message/content")
+                .unwrap(),
+            "from upstream"
+        );
         server.abort();
     }
 }

@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -6,7 +8,8 @@ use uuid::Uuid;
 use crate::{
     capability::CapabilityId,
     context::{
-        CapabilityScope, MoneyBudgetMicros, PrincipalId, RetryBudget, TenantId, TokenBudget,
+        CapabilityScope, MoneyBudgetMicros, PrincipalId, RetryBudget, SideEffectClass, TenantId,
+        TokenBudget,
     },
     digest::Sha256Digest,
 };
@@ -28,6 +31,7 @@ pub struct CapabilityLease {
     pub monetary_budget: MoneyBudgetMicros,
     pub token_budget: TokenBudget,
     pub retry_budget: RetryBudget,
+    pub side_effects: BTreeSet<SideEffectClass>,
     pub manifest_digest: Sha256Digest,
 }
 
@@ -53,16 +57,54 @@ impl CapabilityLease {
         principal: PrincipalId,
         tenant: TenantId,
         request_identity: String,
-        mut capabilities: Vec<CapabilityId>,
+        capabilities: Vec<CapabilityId>,
         scope: CapabilityScope,
         expires_at_monotonic_ms: u64,
         monetary_budget: MoneyBudgetMicros,
         token_budget: TokenBudget,
         retry_budget: RetryBudget,
     ) -> Self {
+        Self::issue_with_side_effects(
+            principal,
+            tenant,
+            request_identity,
+            capabilities,
+            scope,
+            expires_at_monotonic_ms,
+            monetary_budget,
+            token_budget,
+            retry_budget,
+            BTreeSet::from([SideEffectClass::ReadOnly]),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue_with_side_effects(
+        principal: PrincipalId,
+        tenant: TenantId,
+        request_identity: String,
+        mut capabilities: Vec<CapabilityId>,
+        scope: CapabilityScope,
+        expires_at_monotonic_ms: u64,
+        monetary_budget: MoneyBudgetMicros,
+        token_budget: TokenBudget,
+        retry_budget: RetryBudget,
+        side_effects: BTreeSet<SideEffectClass>,
+    ) -> Self {
         capabilities.sort();
         capabilities.dedup();
-        let manifest_digest = manifest_digest(&principal, &tenant, &capabilities, &scope);
+        let manifest_digest = manifest_digest(
+            &principal,
+            &tenant,
+            &request_identity,
+            &capabilities,
+            &scope,
+            expires_at_monotonic_ms,
+            monetary_budget,
+            token_budget,
+            retry_budget,
+            &side_effects,
+        );
         Self {
             id: LeaseId(Uuid::new_v4().to_string()),
             principal,
@@ -74,6 +116,7 @@ impl CapabilityLease {
             monetary_budget,
             token_budget,
             retry_budget,
+            side_effects,
             manifest_digest,
         }
     }
@@ -97,8 +140,14 @@ impl CapabilityLease {
         if manifest_digest(
             &self.principal,
             &self.tenant,
+            &self.request_identity,
             &self.capabilities,
             &self.scope,
+            self.expires_at_monotonic_ms,
+            self.monetary_budget,
+            self.token_budget,
+            self.retry_budget,
+            &self.side_effects,
         ) != self.manifest_digest
         {
             return Err(LeaseError::Manifest);
@@ -117,19 +166,48 @@ impl CapabilityLease {
             Some(_) => Ok(()),
         }
     }
+
+    pub fn authorize_invocation(
+        &self,
+        principal: &PrincipalId,
+        tenant: &TenantId,
+        capability: &CapabilityId,
+        side_effect: SideEffectClass,
+        now_monotonic_ms: u64,
+    ) -> Result<(), LeaseError> {
+        self.authorize(principal, tenant, capability, now_monotonic_ms)?;
+        if self.side_effects.contains(&side_effect) {
+            Ok(())
+        } else {
+            Err(LeaseError::Capability)
+        }
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn manifest_digest(
     principal: &PrincipalId,
     tenant: &TenantId,
+    request_identity: &str,
     capabilities: &[CapabilityId],
     scope: &CapabilityScope,
+    expires_at_monotonic_ms: u64,
+    monetary_budget: MoneyBudgetMicros,
+    token_budget: TokenBudget,
+    retry_budget: RetryBudget,
+    side_effects: &BTreeSet<SideEffectClass>,
 ) -> Sha256Digest {
     Sha256Digest::of_json(&serde_json::json!({
         "principal": principal,
         "tenant": tenant,
+        "requestIdentity": request_identity,
         "capabilities": capabilities,
         "scope": scope,
+        "expiresAtMonotonicMs": expires_at_monotonic_ms,
+        "monetaryBudget": monetary_budget,
+        "tokenBudget": token_budget,
+        "retryBudget": retry_budget,
+        "sideEffects": side_effects,
     }))
 }
 
@@ -199,6 +277,32 @@ mod tests {
                 100,
             ),
             Err(LeaseError::Expired)
+        );
+    }
+
+    #[test]
+    fn budgets_and_side_effects_are_manifest_bound() {
+        let mut tampered = lease();
+        tampered.retry_budget.0 += 1;
+        assert_eq!(
+            tampered.authorize(
+                &PrincipalId("alice".into()),
+                &TenantId("tenant-a".into()),
+                &capability("v1"),
+                0,
+            ),
+            Err(LeaseError::Manifest)
+        );
+
+        assert_eq!(
+            lease().authorize_invocation(
+                &PrincipalId("alice".into()),
+                &TenantId("tenant-a".into()),
+                &capability("v1"),
+                SideEffectClass::NonIdempotentWrite,
+                0,
+            ),
+            Err(LeaseError::Capability)
         );
     }
 }
