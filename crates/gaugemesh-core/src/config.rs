@@ -92,8 +92,17 @@ pub struct ModelConfig {
     pub provider_model_id: String,
     pub context_limit: u64,
     pub max_output_tokens: u64,
+    pub cost_table: ModelCostConfig,
     #[serde(default)]
     pub credential_env: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelCostConfig {
+    pub version: String,
+    pub input_micros_per_million_tokens: u64,
+    pub output_micros_per_million_tokens: u64,
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]

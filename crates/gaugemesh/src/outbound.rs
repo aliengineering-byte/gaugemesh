@@ -3,8 +3,10 @@ use std::{path::Path, time::Duration};
 use anyhow::{Context, Result, bail};
 use gaugemesh_core::protocol::McpRevision;
 use rmcp::{
-    ClientLifecycleMode, ClientServiceExt, Peer, RoleClient, ServiceExt,
+    ClientHandler, ClientLifecycleMode, ClientServiceExt, ErrorData as McpError, Peer, RoleClient,
+    ServiceExt,
     model::{ClientCapabilities, ClientInfo, Implementation, ProtocolVersion},
+    service::RequestContext as McpRequestContext,
     transport::{StreamableHttpClientTransport, TokioChildProcess},
 };
 use serde::Serialize;
@@ -139,16 +141,52 @@ pub async fn discover_stdio(
     result
 }
 
-fn client_info(revision: McpRevision) -> ClientInfo {
+#[derive(Clone)]
+struct GatewayClient {
+    info: ClientInfo,
+}
+
+impl ClientHandler for GatewayClient {
+    fn get_info(&self) -> ClientInfo {
+        self.info.clone()
+    }
+
+    #[allow(deprecated)]
+    async fn create_message(
+        &self,
+        _params: rmcp::model::CreateMessageRequestParams,
+        _context: McpRequestContext<RoleClient>,
+    ) -> Result<rmcp::model::CreateMessageResult, McpError> {
+        Err(sampling_unavailable())
+    }
+
+    async fn create_elicitation(
+        &self,
+        _request: rmcp::model::ElicitRequestParams,
+        _context: McpRequestContext<RoleClient>,
+    ) -> Result<rmcp::model::ElicitResult, McpError> {
+        Ok(rmcp::model::ElicitResult::new(
+            rmcp::model::ElicitationAction::Decline,
+        ))
+    }
+}
+
+fn sampling_unavailable() -> McpError {
+    McpError::invalid_request("GM_SAMPLING_COMPAT_DISABLED", None)
+}
+
+fn client_info(revision: McpRevision) -> GatewayClient {
     let protocol = match revision {
         McpRevision::V2025_11_25 => ProtocolVersion::V_2025_11_25,
         McpRevision::V2026_07_28 => ProtocolVersion::V_2026_07_28,
     };
-    ClientInfo::new(
-        ClientCapabilities::default(),
-        Implementation::new("gaugemesh", env!("CARGO_PKG_VERSION")),
-    )
-    .with_protocol_version(protocol)
+    GatewayClient {
+        info: ClientInfo::new(
+            ClientCapabilities::default(),
+            Implementation::new("gaugemesh", env!("CARGO_PKG_VERSION")),
+        )
+        .with_protocol_version(protocol),
+    }
 }
 
 #[cfg(test)]
@@ -187,5 +225,20 @@ mod tests {
         }
         cancellation.cancel();
         server.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn deprecated_sampling_is_never_silently_dropped() {
+        assert_eq!(
+            sampling_unavailable().message,
+            "GM_SAMPLING_COMPAT_DISABLED"
+        );
+        assert!(
+            client_info(McpRevision::V2026_07_28)
+                .get_info()
+                .capabilities
+                .sampling
+                .is_none()
+        );
     }
 }
