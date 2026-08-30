@@ -62,6 +62,7 @@ pub struct RoutingConfig {
 pub struct McpSourceConfig {
     pub id: String,
     pub transport: McpTransportConfig,
+    pub protocol_revision: String,
     pub sharing: SharingClass,
     pub reviewed: bool,
 }
@@ -135,8 +136,10 @@ impl Config {
             if !source.reviewed {
                 return Err(ConfigError::UnreviewedSource(source.id.clone()));
             }
+            crate::protocol::McpRevision::parse(&source.protocol_revision)
+                .map_err(|_| ConfigError::Version)?;
             if let McpTransportConfig::StreamableHttp { url } = &source.transport {
-                validate_remote_url(url, false)?;
+                validate_remote_url(url, self.listeners.remote.is_none())?;
             }
         }
         for model in &self.models {

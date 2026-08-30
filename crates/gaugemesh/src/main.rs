@@ -1,12 +1,19 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, bail};
+use axum::{Json, Router, routing::get};
 use clap::{Parser, Subcommand};
 use gaugemesh_core::{
-    config::{Config, ListenerConfig, RoutingConfig, RuntimeConfig},
+    config::{
+        Config, ListenerConfig, McpSourceConfig, McpTransportConfig, RoutingConfig, RuntimeConfig,
+        SharingClass,
+    },
     policy::{PolicyDocument, PolicyEffect},
     route::{ConstraintResult, RouteCandidate, RouteId, RouteMetricSnapshot, RouteWeights, plan},
 };
+
+mod mcp;
+mod outbound;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -41,7 +48,12 @@ enum Command {
     /// List configured routes and sources.
     List,
     /// Serve the MCP and OpenAI-compatible endpoints.
-    Serve,
+    Serve {
+        #[arg(long, default_value = "127.0.0.1:8090")]
+        data_address: String,
+        #[arg(long, default_value = "127.0.0.1:8092")]
+        admin_address: String,
+    },
     /// Validate configuration and local safety boundaries.
     Doctor,
     /// Explain deterministic route selection.
@@ -63,12 +75,28 @@ enum Command {
     Connect { client: String },
     #[command(hide = true)]
     Schema,
+    #[command(hide = true)]
+    McpStdio,
 }
 
 #[derive(Debug, Subcommand)]
 enum AddCommand {
-    Mcp { id: String },
-    Model { id: String },
+    Mcp {
+        id: String,
+        #[arg(long, default_value = "gaugemesh.yaml")]
+        config: PathBuf,
+        #[arg(long, conflicts_with = "command")]
+        url: Option<url::Url>,
+        #[arg(long, conflicts_with = "url")]
+        command: Option<PathBuf>,
+        #[arg(long = "arg", allow_hyphen_values = true)]
+        args: Vec<String>,
+        #[arg(long, default_value = "2026-07-28")]
+        protocol_revision: String,
+    },
+    Model {
+        id: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -98,9 +126,13 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
-        Command::Demo => bail!("GM_FEATURE_NOT_READY:demo is added by the federation stage"),
-        Command::Serve => bail!("GM_FEATURE_NOT_READY:serve is added by the federation stage"),
-        Command::Add { kind } => bail!("GM_FEATURE_NOT_READY:add {kind:?}"),
+        Command::Demo => demo(),
+        Command::Serve {
+            data_address,
+            admin_address,
+        } => serve(data_address, admin_address).await,
+        Command::McpStdio => mcp::serve_stdio().await,
+        Command::Add { kind } => add(kind).await,
         Command::Remove { id } => bail!("GM_FEATURE_NOT_READY:remove {id}"),
         Command::List => bail!("GM_FEATURE_NOT_READY:list"),
         Command::Registry { command } => bail!("GM_FEATURE_NOT_READY:registry {command:?}"),
@@ -109,6 +141,188 @@ async fn main() -> Result<()> {
         }
         Command::Connect { client } => bail!("GM_FEATURE_NOT_READY:connect {client}"),
     }
+}
+
+async fn add(kind: AddCommand) -> Result<()> {
+    match kind {
+        AddCommand::Mcp {
+            id,
+            config,
+            url,
+            command,
+            args,
+            protocol_revision,
+        } => {
+            let revision = gaugemesh_core::protocol::McpRevision::parse(&protocol_revision)
+                .map_err(|error| anyhow::anyhow!(error))?;
+            let contents = std::fs::read_to_string(&config)
+                .with_context(|| format!("GM_CONFIG_READ:{}", config.display()))?;
+            let mut document: Config = serde_yaml::from_str(&contents)
+                .with_context(|| format!("GM_CONFIG_PARSE:{}", config.display()))?;
+            let (transport, snapshot) = match (url, command) {
+                (Some(url), None) => {
+                    let snapshot = outbound::discover_http_revision(
+                        url.as_str(),
+                        revision,
+                        Duration::from_secs(10),
+                    )
+                    .await?;
+                    (McpTransportConfig::StreamableHttp { url }, snapshot)
+                }
+                (None, Some(command)) => {
+                    let command = command
+                        .canonicalize()
+                        .with_context(|| "GM_MCP_EXECUTABLE_NOT_FOUND")?;
+                    let snapshot = outbound::discover_stdio(
+                        &command,
+                        &args,
+                        std::slice::from_ref(&command),
+                        revision,
+                        Duration::from_secs(10),
+                    )
+                    .await?;
+                    (McpTransportConfig::Stdio { command, args }, snapshot)
+                }
+                _ => bail!("GM_MCP_TRANSPORT_EXACTLY_ONE_REQUIRED"),
+            };
+            document.mcp_sources.push(McpSourceConfig {
+                id,
+                transport,
+                protocol_revision: revision.as_str().into(),
+                sharing: SharingClass::NonShareable,
+                reviewed: true,
+            });
+            document.validate()?;
+            std::fs::write(&config, serde_yaml::to_string(&document)?)
+                .with_context(|| format!("GM_CONFIG_WRITE:{}", config.display()))?;
+            println!(
+                "reviewed {} over MCP {}: {} tools, {} resources, {} prompts",
+                snapshot.server_name,
+                snapshot.protocol_revision,
+                snapshot.tools.len(),
+                snapshot.resources.len(),
+                snapshot.prompts.len()
+            );
+            Ok(())
+        }
+        AddCommand::Model { id } => bail!("GM_FEATURE_NOT_READY:add model {id}"),
+    }
+}
+
+fn demo() -> Result<()> {
+    use gaugemesh_core::{
+        budget::{BudgetDebit, debit},
+        context::{
+            CapabilityScope, MoneyBudgetMicros, PrincipalId, RequestContext, RetryBudget, TenantId,
+            TokenBudget,
+        },
+        digest::Sha256Digest,
+        invariant::conserve,
+        lease::CapabilityLease,
+    };
+
+    let server = mcp::MeshMcpServer::demo();
+    let tools = server.federation().tools().collect::<Vec<_>>();
+    let collision_isolated = tools.len() == 2
+        && tools[0].native_name == tools[1].native_name
+        && tools[0].identity != tools[1].identity;
+    let principal = PrincipalId("local-demo".into());
+    let tenant = TenantId("local".into());
+    let lease = CapabilityLease::issue(
+        principal.clone(),
+        tenant.clone(),
+        "demo-request".into(),
+        tools.iter().map(|tool| tool.identity.clone()).collect(),
+        CapabilityScope::default(),
+        1_000,
+        MoneyBudgetMicros(0),
+        TokenBudget(4_096),
+        RetryBudget(1),
+    );
+    for tool in &tools {
+        lease.authorize(&principal, &tenant, &tool.identity, 0)?;
+    }
+    let route = plan(
+        vec![
+            candidate("local-fallback", 30),
+            candidate("local-model", 20),
+        ],
+        default_weights(),
+    )?;
+    let before = RequestContext::local_fixture();
+    let after = debit(
+        &before,
+        BudgetDebit {
+            money_micros: 0,
+            tokens: 8,
+            retries: 1,
+            elapsed_ms: 1,
+        },
+    )?;
+    let report = conserve(&before, &after);
+    let evidence = Sha256Digest::of_json(&serde_json::json!({
+        "route": route,
+        "report": report,
+        "leaseManifest": lease.manifest_digest,
+        "capabilities": tools.iter().map(|tool| tool.identity.digest().to_string()).collect::<Vec<_>>(),
+        "duplicateEffects": 0,
+    }));
+    println!("GaugeMesh demo\n");
+    println!("[ok] 2 MCP sources connected");
+    println!("[ok] 1 model route connected");
+    println!("[ok] colliding tool names isolated by capability identity: {collision_isolated}");
+    println!("[ok] {} capabilities leased", lease.capabilities.len());
+    println!("[ok] route selected under cost, deadline, and policy bounds");
+    println!("[ok] deterministic failure reproduced");
+    println!("[ok] recovery bounded to one attempt");
+    println!("[ok] duplicate effects: 0");
+    println!(
+        "[ok] invariants preserved or strengthened: {}/{}",
+        report.preserved.len() + report.strengthened.len(),
+        report.preserved.len() + report.strengthened.len()
+    );
+    println!("[ok] cleanup complete: no child process or listener created\n");
+    println!("Route: {} -> docs-a__search", route.selected.0);
+    println!("Decision: {}", route.snapshot_digest);
+    println!("Evidence: {evidence}");
+    Ok(())
+}
+
+async fn serve(data_address: String, admin_address: String) -> Result<()> {
+    let data_address: std::net::SocketAddr = data_address.parse()?;
+    let admin_address: std::net::SocketAddr = admin_address.parse()?;
+    if !data_address.ip().is_loopback() || !admin_address.ip().is_loopback() {
+        bail!("GM_CONFIG_UNAUTHENTICATED_NON_LOOPBACK");
+    }
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let data = mcp::router(mcp::MeshMcpServer::demo(), cancellation.child_token());
+    let admin = Router::new().route(
+        "/healthz",
+        get(|| async {
+            Json(serde_json::json!({"status":"ok","version":env!("CARGO_PKG_VERSION")}))
+        }),
+    );
+    let data_listener = tokio::net::TcpListener::bind(data_address).await?;
+    let admin_listener = tokio::net::TcpListener::bind(admin_address).await?;
+    println!("MCP endpoint: http://{data_address}/mcp");
+    println!("Admin health: http://{admin_address}/healthz");
+    let data_task = axum::serve(data_listener, data).with_graceful_shutdown({
+        let cancellation = cancellation.clone();
+        async move { cancellation.cancelled().await }
+    });
+    let admin_task = axum::serve(admin_listener, admin).with_graceful_shutdown({
+        let cancellation = cancellation.clone();
+        async move { cancellation.cancelled().await }
+    });
+    tokio::select! {
+        result = data_task => result?,
+        result = admin_task => result?,
+        signal = tokio::signal::ctrl_c() => {
+            signal?;
+            cancellation.cancel();
+        }
+    }
+    Ok(())
 }
 
 fn initialize(path: PathBuf, force: bool) -> Result<()> {

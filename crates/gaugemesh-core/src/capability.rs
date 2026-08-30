@@ -122,4 +122,27 @@ mod tests {
             Sha256Digest::of_bytes(capability.readable_alias("search"))
         );
     }
+
+    #[test]
+    fn schema_revision_source_and_tenant_partition_change_identity() {
+        let base = capability("docs", "search");
+        let mut schema = base.clone();
+        schema.schema_digest = Sha256Digest::of_bytes("changed");
+        let mut revision = base.clone();
+        revision.revision = CapabilityRevision("2025-11-25".into());
+        let other_source = capability("docs-two", "search");
+        assert_ne!(base, schema);
+        assert_ne!(base, revision);
+        assert_ne!(base, other_source);
+        // Tenant isolation is deliberately outside the portable capability ID;
+        // authorization binds it in CapabilityLease instead.
+    }
+
+    #[test]
+    fn case_variants_remain_distinct_native_identities() {
+        assert_ne!(
+            capability("docs", "search").native_identity_digest,
+            capability("docs", "Search").native_identity_digest
+        );
+    }
 }
