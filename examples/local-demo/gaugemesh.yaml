@@ -1,0 +1,23 @@
+version: 1
+runtime:
+  mode: memory
+listeners:
+  data_address: 127.0.0.1:8090
+  admin_address: 127.0.0.1:8092
+routing:
+  weights:
+    latency: 10
+    cost: 30
+    failure: 30
+    semantic_loss: 1000
+    pressure: 20
+    exposure: 50
+    switching: 10
+  max_queue_per_tenant: 32
+  max_concurrent_per_tenant: 4
+policy:
+  default: deny
+  rules: []
+mcp_sources: []
+models: []
+
