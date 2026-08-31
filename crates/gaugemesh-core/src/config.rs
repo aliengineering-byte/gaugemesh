@@ -529,7 +529,7 @@ mod tests {
         config.mcp_sources.push(McpSourceConfig {
             id: "duplicate".into(),
             transport: McpTransportConfig::Stdio {
-                command: PathBuf::from("/reviewed/server"),
+                command: std::env::temp_dir().join("reviewed-server"),
                 args: vec![],
             },
             protocol_revision: "2025-11-25".into(),

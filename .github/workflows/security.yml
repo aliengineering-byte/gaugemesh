@@ -66,5 +66,5 @@ jobs:
       - uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2
         with:
           tool: cargo-fuzz@0.13.2
-      - run: cargo +nightly-2026-08-30 fuzz run --fuzz-dir fuzz config "$RUNNER_TEMP/fuzz-corpus/config" -- -max_total_time=15 -artifact_prefix="$RUNNER_TEMP/fuzz-artifacts/config/"
-      - run: cargo +nightly-2026-08-30 fuzz run --fuzz-dir fuzz protocol_revision "$RUNNER_TEMP/fuzz-corpus/protocol_revision" -- -max_total_time=15 -artifact_prefix="$RUNNER_TEMP/fuzz-artifacts/protocol_revision/"
+      - run: cargo +nightly-2026-08-30 fuzz run --fuzz-dir fuzz --target x86_64-unknown-linux-gnu config "$RUNNER_TEMP/fuzz-corpus/config" -- -max_total_time=15 -artifact_prefix="$RUNNER_TEMP/fuzz-artifacts/config/"
+      - run: cargo +nightly-2026-08-30 fuzz run --fuzz-dir fuzz --target x86_64-unknown-linux-gnu protocol_revision "$RUNNER_TEMP/fuzz-corpus/protocol_revision" -- -max_total_time=15 -artifact_prefix="$RUNNER_TEMP/fuzz-artifacts/protocol_revision/"
