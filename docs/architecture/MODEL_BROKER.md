@@ -50,10 +50,11 @@ a tool-role message only after the lease and side-effect checks pass.
 
 RMCP supplies the current MRTR wire primitives. GaugeMesh does not advertise deprecated sampling.
 If an upstream sends a sampling request anyway, `GatewayClient` returns
-`GM_SAMPLING_COMPAT_DISABLED`; it never drops the request. Sampling enablement, model approval, and
-nested tool use are intentionally unavailable in the developer preview. Elicitation uses `DENY` by
-default and returns an explicit decline. Static policy, local CLI, and signed-webhook approval are
-typed future modes, not implied current support.
+`GM_SAMPLING_COMPAT_DISABLED`; it never drops the request. Sampling enablement and nested tool use
+are intentionally unavailable in the developer preview. Elicitation uses `DENY` by default and
+returns an explicit decline. Form elicitation can instead use a schema-validated static response,
+a terminal-only local CLI prompt, or a DNS-pinned HTTPS webhook whose request and response are
+HMAC-bound to a fresh nonce. URL elicitation is not advertised and fails closed.
 
 ## Limitations
 

@@ -14,6 +14,8 @@ pub struct Overloaded {
 pub struct DeficitRoundRobin<T> {
     tenants: VecDeque<TenantQueue<T>>,
     max_per_tenant: usize,
+    max_tenants: usize,
+    total_items: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -26,13 +28,29 @@ struct TenantQueue<T> {
 
 impl<T> DeficitRoundRobin<T> {
     pub fn new(max_per_tenant: usize) -> Self {
+        Self::with_limits(max_per_tenant, 1_024)
+    }
+
+    pub fn with_limits(max_per_tenant: usize, max_tenants: usize) -> Self {
+        assert!(max_per_tenant > 0 && max_tenants > 0);
         Self {
             tenants: VecDeque::new(),
             max_per_tenant,
+            max_tenants,
+            total_items: 0,
         }
     }
 
     pub fn push(&mut self, tenant: &str, cost: usize, value: T) -> Result<(), Overloaded> {
+        if tenant.is_empty()
+            || cost > 10_000
+            || (!self.tenants.iter().any(|queue| queue.tenant == tenant)
+                && self.tenants.len() >= self.max_tenants)
+        {
+            return Err(Overloaded {
+                retry_after_ms: 100,
+            });
+        }
         let queue =
             if let Some(position) = self.tenants.iter().position(|queue| queue.tenant == tenant) {
                 &mut self.tenants[position]
@@ -51,6 +69,7 @@ impl<T> DeficitRoundRobin<T> {
             });
         }
         queue.items.push_back((cost.max(1), value));
+        self.total_items += 1;
         Ok(())
     }
 
@@ -63,6 +82,7 @@ impl<T> DeficitRoundRobin<T> {
             {
                 let (cost, value) = queue.items.pop_front().expect("front existed");
                 queue.deficit -= cost;
+                self.total_items = self.total_items.saturating_sub(1);
                 if !queue.items.is_empty() {
                     self.tenants.push_back(queue);
                 }
@@ -71,6 +91,14 @@ impl<T> DeficitRoundRobin<T> {
             self.tenants.push_back(queue);
         }
         None
+    }
+
+    pub fn len(&self) -> usize {
+        self.total_items
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.total_items == 0
     }
 }
 
@@ -152,6 +180,20 @@ mod tests {
         queue.push("b", 1, 3).unwrap();
         assert_eq!(queue.pop(), Some(1));
         assert_eq!(queue.pop(), Some(3));
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn tenant_cardinality_is_bounded_and_scheduling_is_fair() {
+        let mut queue = DeficitRoundRobin::with_limits(2, 2);
+        queue.push("a", 1, "a1").unwrap();
+        queue.push("a", 1, "a2").unwrap();
+        queue.push("b", 1, "b1").unwrap();
+        assert!(queue.push("c", 1, "c1").is_err());
+        assert_eq!(queue.len(), 3);
+        assert_eq!(queue.pop(), Some("a1"));
+        assert_eq!(queue.pop(), Some("b1"));
+        assert_eq!(queue.pop(), Some("a2"));
     }
 
     #[test]

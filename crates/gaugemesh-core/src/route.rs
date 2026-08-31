@@ -133,6 +133,23 @@ pub fn plan(
     mut candidates: Vec<RouteCandidate>,
     weights: RouteWeights,
 ) -> Result<RoutePlan, RouteError> {
+    if [
+        weights.latency,
+        weights.cost,
+        weights.failure,
+        weights.semantic_loss,
+        weights.pressure,
+        weights.exposure,
+        weights.switching,
+    ]
+    .into_iter()
+    .any(|weight| weight > 10_000)
+        || candidates
+            .iter()
+            .any(|candidate| candidate.semantic_loss > 10_000)
+    {
+        return Err(RouteError::MetricOutOfRange);
+    }
     candidates.sort_by(|left, right| left.route_id.cmp(&right.route_id));
     let snapshot_digest = Sha256Digest::of_json(
         &serde_json::to_value((&candidates, weights)).expect("route snapshot serializes"),
@@ -271,5 +288,97 @@ mod tests {
             route.explanation.tie_breaker,
             "lexicographically smallest stable route_id"
         );
+    }
+
+    #[test]
+    fn switching_penalty_prevents_flapping_for_subthreshold_changes() {
+        let mut incumbent = candidate("incumbent");
+        incumbent.metrics.latency = 11;
+        incumbent.metrics.switching = 0;
+        let mut alternative = candidate("alternative");
+        alternative.metrics.latency = 10;
+        alternative.metrics.switching = 2;
+        assert_eq!(
+            plan(vec![alternative, incumbent], weights())
+                .unwrap()
+                .selected,
+            RouteId("incumbent".into())
+        );
+    }
+
+    #[test]
+    fn unnormalized_metrics_and_weights_fail_closed() {
+        let mut invalid = candidate("invalid");
+        invalid.semantic_loss = 10_001;
+        assert_eq!(
+            plan(vec![invalid], weights()),
+            Err(RouteError::MetricOutOfRange)
+        );
+        let mut invalid_weights = weights();
+        invalid_weights.switching = 10_001;
+        assert_eq!(
+            plan(vec![candidate("route")], invalid_weights),
+            Err(RouteError::MetricOutOfRange)
+        );
+
+        let mut boundary = candidate("boundary");
+        boundary.metrics.latency = 10_000;
+        boundary.semantic_loss = 10_000;
+        let mut boundary_weights = weights();
+        boundary_weights.latency = 10_000;
+        assert!(plan(vec![boundary], boundary_weights).is_ok());
+    }
+
+    #[test]
+    fn every_score_term_is_independently_weighted_and_included_once() {
+        let terms = ScoreTerms {
+            latency: 2,
+            cost: 3,
+            failure: 5,
+            semantic_loss: 7,
+            pressure: 11,
+            exposure: 13,
+            switching: 17,
+        };
+        assert_eq!(terms.total(), 58);
+
+        let candidate = RouteCandidate {
+            route_id: RouteId("only".into()),
+            endpoint_id: "endpoint".into(),
+            hard_constraints: ConstraintResult {
+                allowed: true,
+                rejections: vec![],
+            },
+            metrics: RouteMetricSnapshot {
+                latency: 2,
+                cost: 3,
+                failure: 5,
+                pressure: 7,
+                exposure: 11,
+                switching: 13,
+            },
+            semantic_loss: 17,
+        };
+        let weights = RouteWeights {
+            latency: 19,
+            cost: 23,
+            failure: 29,
+            semantic_loss: 31,
+            pressure: 37,
+            exposure: 41,
+            switching: 43,
+        };
+        let plan = plan(vec![candidate], weights).unwrap();
+        let expected = ScoreTerms {
+            latency: 38,
+            cost: 69,
+            failure: 145,
+            semantic_loss: 527,
+            pressure: 259,
+            exposure: 451,
+            switching: 559,
+        };
+        assert_eq!(plan.explanation.candidates[0].terms, Some(expected.clone()));
+        assert_eq!(plan.action_score, expected.total());
     }
 }

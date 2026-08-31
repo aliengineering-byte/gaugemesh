@@ -1,0 +1,28 @@
+[package]
+name = "gaugemesh-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+serde_json = "=1.0.151"
+serde_yaml = "=0.9.34"
+gaugemesh-core = { path = "../crates/gaugemesh-core" }
+
+[[bin]]
+name = "config"
+path = "fuzz_targets/config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "protocol_revision"
+path = "fuzz_targets/protocol_revision.rs"
+test = false
+doc = false
+bench = false

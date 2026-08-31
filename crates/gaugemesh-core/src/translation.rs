@@ -28,6 +28,14 @@ pub enum TranslationError {
     RequiredField(String),
 }
 
+pub fn require_representable(field: &str, representable: bool) -> Result<(), TranslationError> {
+    if representable {
+        Ok(())
+    } else {
+        Err(TranslationError::RequiredField(field.into()))
+    }
+}
+
 pub fn report_translation<I: Serialize, O: Serialize>(
     input: &I,
     output: &O,
@@ -58,4 +66,58 @@ pub fn report_translation<I: Serialize, O: Serialize>(
         &serde_json::to_value(output).expect("adapter output serializes"),
     ));
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::invariant::SemanticLoss;
+    use serde_json::json;
+
+    #[test]
+    fn required_fields_and_excess_optional_loss_are_rejected() {
+        assert_eq!(
+            require_representable("resultType", false),
+            Err(TranslationError::RequiredField("resultType".into()))
+        );
+        let context = RequestContext::local_fixture();
+        assert_eq!(
+            report_translation(
+                &json!({"input": true}),
+                &json!({"output": true}),
+                &context,
+                &context,
+                vec![SemanticLoss {
+                    field: "optionalHint".into(),
+                    reason: "target revision cannot encode the hint".into(),
+                    weight: 5,
+                }],
+                4,
+            ),
+            Err(TranslationError::LossExceeded { score: 5, limit: 4 })
+        );
+    }
+
+    #[test]
+    fn optional_loss_equal_to_the_limit_is_accepted() {
+        let context = RequestContext::local_fixture();
+        let losses = vec![SemanticLoss {
+            field: "optionalHint".into(),
+            reason: "target revision cannot encode the hint".into(),
+            weight: 4,
+        }];
+
+        let report = report_translation(
+            &json!({"input": true}),
+            &json!({"output": true}),
+            &context,
+            &context,
+            losses.clone(),
+            4,
+        )
+        .expect("loss equal to the configured limit remains representable");
+
+        assert_eq!(report.semantic_loss_score, 4);
+        assert_eq!(report.optional_losses, losses);
+    }
 }

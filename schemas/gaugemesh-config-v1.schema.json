@@ -53,6 +53,79 @@
     "policy"
   ],
   "$defs": {
+    "ApprovalConfig": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "const": "deny"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "mode"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "const": "static_policy"
+            },
+            "response": true
+          },
+          "additionalProperties": false,
+          "required": [
+            "mode",
+            "response"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "const": "local_cli"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "mode"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "const": "signed_webhook"
+            },
+            "secret_env": {
+              "type": "string"
+            },
+            "timeout_ms": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0,
+              "default": 5000
+            },
+            "url": {
+              "type": "string",
+              "format": "uri"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "mode",
+            "url",
+            "secret_env"
+          ]
+        }
+      ]
+    },
     "CapabilityMode": {
       "type": "string",
       "enum": [
@@ -113,6 +186,19 @@
     "McpSourceConfig": {
       "type": "object",
       "properties": {
+        "approval": {
+          "$ref": "#/$defs/ApprovalConfig",
+          "default": {
+            "mode": "deny"
+          }
+        },
+        "capability_snapshot_digest": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "id": {
           "type": "string"
         },
@@ -329,13 +415,38 @@
         "audience": {
           "type": "string"
         },
+        "clock_skew_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 30
+        },
         "issuer": {
+          "type": "string",
+          "format": "uri"
+        },
+        "jwks_cache_ttl_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 300
+        },
+        "jwks_url": {
           "type": "string",
           "format": "uri"
         },
         "public_origin": {
           "type": "string",
           "format": "uri"
+        },
+        "required_scopes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "resource": {
+          "type": "string"
         },
         "tls_certificate": {
           "type": "string"
@@ -358,7 +469,10 @@
         "tls_private_key",
         "public_origin",
         "issuer",
-        "audience"
+        "audience",
+        "resource",
+        "jwks_url",
+        "required_scopes"
       ]
     },
     "RouteWeights": {

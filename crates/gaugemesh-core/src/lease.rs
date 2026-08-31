@@ -265,6 +265,15 @@ mod tests {
             ),
             Err(LeaseError::Tenant)
         );
+        assert_eq!(
+            lease.authorize(
+                &PrincipalId("mallory".into()),
+                &TenantId("tenant-a".into()),
+                &capability("v1"),
+                0,
+            ),
+            Err(LeaseError::Principal)
+        );
     }
 
     #[test]

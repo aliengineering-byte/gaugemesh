@@ -68,3 +68,56 @@ pub fn debit(context: &RequestContext, debit: BudgetDebit) -> Result<RequestCont
     }
     Ok(output)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_successful_debit_only_decreases_budgets_and_records_each_retry() {
+        let mut context = RequestContext::local_fixture();
+        context.monetary_budget = MoneyBudgetMicros(100);
+        context.token_budget = TokenBudget(200);
+        context.retry_budget = RetryBudget(3);
+        context.deadline.0 = 1_000;
+        let output = debit(
+            &context,
+            BudgetDebit {
+                money_micros: 40,
+                tokens: 50,
+                retries: 2,
+                elapsed_ms: 250,
+            },
+        )
+        .unwrap();
+        assert_eq!(output.monetary_budget, MoneyBudgetMicros(60));
+        assert_eq!(output.token_budget, TokenBudget(150));
+        assert_eq!(output.retry_budget, RetryBudget(1));
+        assert_eq!(output.deadline.0, 750);
+        assert_eq!(output.budget_debits.len(), 1);
+        assert_eq!(output.retry_attempts.len(), 2);
+    }
+
+    #[test]
+    fn an_exhausted_dimension_fails_transactionally() {
+        let mut context = RequestContext::local_fixture();
+        context.monetary_budget = MoneyBudgetMicros(10);
+        context.token_budget = TokenBudget(10);
+        context.retry_budget = RetryBudget(1);
+        context.deadline.0 = 10;
+        let snapshot = context.clone();
+        assert_eq!(
+            debit(
+                &context,
+                BudgetDebit {
+                    money_micros: 0,
+                    tokens: 11,
+                    retries: 0,
+                    elapsed_ms: 0,
+                },
+            ),
+            Err(BudgetError::Tokens)
+        );
+        assert_eq!(context, snapshot);
+    }
+}
