@@ -1,0 +1,24 @@
+name: Bug report
+description: Report reproducible GaugeMesh behavior without including secrets.
+body:
+  - type: markdown
+    attributes:
+      value: Do not include credentials, private prompts, tool bodies, or authorization headers.
+  - type: input
+    id: version
+    attributes:
+      label: GaugeMesh version
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Sanitized reproduction
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and observed behavior
+    validations:
+      required: true
