@@ -20,16 +20,15 @@ resource templates, and prompts, and then cancel and join their owned transport.
 
 Limitations for 0.1:
 
-- The official conformance inventory is recorded separately in release hardening; an SDK claim is
+- The official conformance inventory is recorded in `CONFORMANCE.md`; an SDK claim is
   not a GaugeMesh conformance or certification claim.
 - Upstream change notifications are represented by immutable capability revision and schema
   snapshots in the federation. Live notification fan-out is not yet implemented.
-- Current MRTR wire handling comes from RMCP. GaugeMesh does not yet expose a user-configurable
-  nested-request policy; unsupported bridge requests return explicit errors in the model-broker
-  layer.
-- The deterministic in-memory fixture is the only federated source loaded by `serve` in this PR.
-  `add mcp` performs live reviewed discovery and writes configuration; loading arbitrary configured
-  sources into the long-lived pool is release-hardening work.
+- Current MRTR wire handling comes from RMCP. Unsupported bridge requests return explicit errors
+  in the model-broker layer rather than disappearing.
+- `add mcp` performs live reviewed discovery, pins the complete capability-manifest digest, and
+  writes configuration. `serve` loads configured sources transactionally into the bounded runtime;
+  startup and restart reject identity drift.
 
 ## Federation modes
 
