@@ -85,6 +85,30 @@ pub enum FederationError {
 }
 
 impl Federation {
+    pub fn merge(&mut self, other: Self) -> Result<(), FederationError> {
+        if other.tools.keys().any(|key| self.tools.contains_key(key))
+            || other
+                .resources
+                .keys()
+                .any(|key| self.resources.contains_key(key))
+            || other
+                .prompts
+                .keys()
+                .any(|key| self.prompts.contains_key(key))
+            || other
+                .templates
+                .keys()
+                .any(|key| self.templates.contains_key(key))
+        {
+            return Err(FederationError::AliasCollision);
+        }
+        self.tools.extend(other.tools);
+        self.resources.extend(other.resources);
+        self.prompts.extend(other.prompts);
+        self.templates.extend(other.templates);
+        Ok(())
+    }
+
     pub fn insert_tool(&mut self, tool: FederatedTool) -> Result<(), FederationError> {
         if self.tools.contains_key(&tool.alias) {
             return Err(FederationError::AliasCollision);

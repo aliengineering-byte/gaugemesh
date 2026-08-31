@@ -233,4 +233,50 @@ mod tests {
             PolicyCompileError::UnreachableRule("hidden".into())
         );
     }
+
+    #[test]
+    fn evaluation_matches_phase_and_every_condition_then_falls_back_to_default() {
+        let policy = compile(PolicyDocument {
+            default: PolicyEffect::Deny,
+            rules: vec![PolicyRule {
+                id: "tenant-mcp".into(),
+                phase: PolicyPhase::RequestMetadata,
+                priority: 7,
+                effect: PolicyEffect::Allow,
+                all: vec![
+                    Condition {
+                        field: "tenant.id".into(),
+                        equals: "tenant-a".into(),
+                    },
+                    Condition {
+                        field: "request.protocol".into(),
+                        equals: "mcp".into(),
+                    },
+                ],
+            }],
+        })
+        .unwrap();
+        assert_eq!(policy.document().default, PolicyEffect::Deny);
+        assert_eq!(policy.document().rules[0].id, "tenant-mcp");
+
+        let matching = BTreeMap::from([
+            ("tenant.id".into(), "tenant-a".into()),
+            ("request.protocol".into(), "mcp".into()),
+        ]);
+        assert_eq!(
+            policy.evaluate(PolicyPhase::RequestMetadata, &matching),
+            PolicyEffect::Allow
+        );
+        assert_eq!(
+            policy.evaluate(PolicyPhase::Discovery, &matching),
+            PolicyEffect::Deny
+        );
+
+        let mut mismatch = matching;
+        mismatch.insert("request.protocol".into(), "openai".into());
+        assert_eq!(
+            policy.evaluate(PolicyPhase::RequestMetadata, &mismatch),
+            PolicyEffect::Deny
+        );
+    }
 }

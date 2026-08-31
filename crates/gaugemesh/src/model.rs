@@ -1,15 +1,16 @@
 use std::{sync::Arc, time::Duration};
 
+use crate::auth::AuthenticatedIdentity;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, Extension, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response, sse::Event},
     routing::{get, post},
 };
-use futures_util::stream;
+use futures_util::{StreamExt as _, stream};
 use gaugemesh_core::{
     config::ModelConfig,
     context::{
@@ -62,37 +63,35 @@ impl ModelBroker {
         }
     }
 
-    fn configured(models: &[ModelConfig], federation: Federation) -> Result<Self> {
-        let providers = models
-            .iter()
-            .map(|model| {
-                let authorization = model
-                    .credential_env
-                    .as_deref()
-                    .map(|name| {
-                        let value = std::env::var(name)
-                            .with_context(|| "GM_MODEL_CREDENTIAL_ENV_MISSING")?;
-                        HeaderValue::from_str(&format!("Bearer {value}"))
-                            .context("GM_MODEL_CREDENTIAL_INVALID")
-                    })
-                    .transpose()?;
-                let provider = OpenAiCompatibleProvider::configured(model, authorization)?;
-                Ok(ModelRoute {
-                    alias: model.id.clone(),
-                    provider: Arc::new(provider),
-                    cost_table: CostTable {
-                        version: model.cost_table.version.clone(),
-                        input_micros_per_million_tokens: model
-                            .cost_table
-                            .input_micros_per_million_tokens,
-                        output_micros_per_million_tokens: model
-                            .cost_table
-                            .output_micros_per_million_tokens,
-                    },
-                    max_output_tokens: model.max_output_tokens,
+    async fn configured(models: &[ModelConfig], federation: Federation) -> Result<Self> {
+        let mut providers = Vec::with_capacity(models.len());
+        for model in models {
+            let authorization = model
+                .credential_env
+                .as_deref()
+                .map(|name| {
+                    let value =
+                        std::env::var(name).with_context(|| "GM_MODEL_CREDENTIAL_ENV_MISSING")?;
+                    HeaderValue::from_str(&format!("Bearer {value}"))
+                        .context("GM_MODEL_CREDENTIAL_INVALID")
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
+                .transpose()?;
+            let provider = OpenAiCompatibleProvider::configured(model, authorization).await?;
+            providers.push(ModelRoute {
+                alias: model.id.clone(),
+                provider: Arc::new(provider),
+                cost_table: CostTable {
+                    version: model.cost_table.version.clone(),
+                    input_micros_per_million_tokens: model
+                        .cost_table
+                        .input_micros_per_million_tokens,
+                    output_micros_per_million_tokens: model
+                        .cost_table
+                        .output_micros_per_million_tokens,
+                },
+                max_output_tokens: model.max_output_tokens,
+            });
+        }
         if providers.is_empty() {
             bail!("GM_MODEL_NO_CONFIGURED_PROVIDER");
         }
@@ -107,10 +106,10 @@ pub fn router() -> Router {
     router_for_broker(ModelBroker::fixture())
 }
 
-pub fn router_from_config(models: &[ModelConfig], federation: Federation) -> Result<Router> {
-    Ok(router_for_broker(ModelBroker::configured(
-        models, federation,
-    )?))
+pub async fn router_from_config(models: &[ModelConfig], federation: Federation) -> Result<Router> {
+    Ok(router_for_broker(
+        ModelBroker::configured(models, federation).await?,
+    ))
 }
 
 fn router_for_broker(broker: ModelBroker) -> Router {
@@ -240,7 +239,7 @@ pub struct OpenAiCompatibleProvider {
 }
 
 impl OpenAiCompatibleProvider {
-    pub fn new(
+    pub async fn new(
         base_url: Url,
         provider_model_id: String,
         authorization: Option<HeaderValue>,
@@ -249,10 +248,7 @@ impl OpenAiCompatibleProvider {
             bail!("GM_MODEL_PROVIDER_SCHEME_DENIED");
         }
         let endpoint_identity = Sha256Digest::of_bytes(base_url.as_str());
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(30))
-            .build()?;
+        let client = safe_provider_client(&base_url).await?;
         Ok(Self {
             identity: ModelIdentity {
                 provider: "openai-compatible".into(),
@@ -272,12 +268,13 @@ impl OpenAiCompatibleProvider {
         })
     }
 
-    fn configured(config: &ModelConfig, authorization: Option<HeaderValue>) -> Result<Self> {
+    async fn configured(config: &ModelConfig, authorization: Option<HeaderValue>) -> Result<Self> {
         let mut provider = Self::new(
             config.base_url.clone(),
             config.provider_model_id.clone(),
             authorization,
-        )?;
+        )
+        .await?;
         provider.identity.context_limit = config.context_limit;
         provider.identity.cost_table_version = config.cost_table.version.clone();
         provider.identity.policy_digest = Sha256Digest::of_json(&json!({
@@ -301,7 +298,7 @@ pub async fn inspect_openai_provider(
         })
         .transpose()?;
     let provider =
-        OpenAiCompatibleProvider::new(base_url, provider_model_id.clone(), authorization)?;
+        OpenAiCompatibleProvider::new(base_url, provider_model_id.clone(), authorization).await?;
     let url = provider
         .base_url
         .join("models")
@@ -384,11 +381,45 @@ async fn bounded_provider_json(response: reqwest::Response) -> Result<Value> {
     {
         bail!("GM_MODEL_PROVIDER_RESPONSE_TOO_LARGE");
     }
-    let bytes = response.bytes().await.context("GM_MODEL_PROVIDER_BODY")?;
-    if bytes.len() > MAX_PROVIDER_RESPONSE_BYTES {
-        bail!("GM_MODEL_PROVIDER_RESPONSE_TOO_LARGE");
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("GM_MODEL_PROVIDER_BODY")?;
+        if bytes.len().saturating_add(chunk.len()) > MAX_PROVIDER_RESPONSE_BYTES {
+            bail!("GM_MODEL_PROVIDER_RESPONSE_TOO_LARGE");
+        }
+        bytes.extend_from_slice(&chunk);
     }
     serde_json::from_slice(&bytes).context("GM_MODEL_PROVIDER_JSON")
+}
+
+async fn safe_provider_client(base_url: &Url) -> Result<reqwest::Client> {
+    let host = base_url
+        .host_str()
+        .context("GM_MODEL_PROVIDER_URL_INVALID")?;
+    let local = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    if !matches!(base_url.scheme(), "http" | "https") || (base_url.scheme() == "http" && !local) {
+        bail!("GM_MODEL_PROVIDER_SCHEME_DENIED");
+    }
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(30));
+    if !local {
+        let origin = gaugemesh_core::security::ResolvedOrigin::resolve(base_url, false)
+            .await
+            .context("GM_MODEL_PROVIDER_ORIGIN")?;
+        let addresses = origin
+            .addresses
+            .iter()
+            .map(|address| std::net::SocketAddr::new(*address, origin.port))
+            .collect::<Vec<_>>();
+        builder = builder.resolve_to_addrs(&origin.host, &addresses);
+    }
+    builder.build().context("GM_MODEL_PROVIDER_CLIENT")
 }
 
 async fn list_models(State(broker): State<ModelBroker>) -> Json<Value> {
@@ -418,6 +449,7 @@ async fn list_models(State(broker): State<ModelBroker>) -> Json<Value> {
 
 async fn chat_completions(
     State(broker): State<ModelBroker>,
+    identity: Option<Extension<AuthenticatedIdentity>>,
     headers: HeaderMap,
     Json(value): Json<Value>,
 ) -> Response {
@@ -437,6 +469,7 @@ async fn chat_completions(
         &request.model,
         request.messages,
         request.max_tokens,
+        identity.as_deref(),
     )
     .await
     {
@@ -448,6 +481,7 @@ async fn chat_completions(
 
 async fn responses(
     State(broker): State<ModelBroker>,
+    identity: Option<Extension<AuthenticatedIdentity>>,
     headers: HeaderMap,
     Json(value): Json<Value>,
 ) -> Response {
@@ -471,6 +505,7 @@ async fn responses(
         &request.model,
         messages,
         request.max_output_tokens,
+        identity.as_deref(),
     )
     .await
     {
@@ -505,6 +540,7 @@ async fn execute(
     model: &str,
     messages: Vec<Message>,
     max_output: u64,
+    identity: Option<&AuthenticatedIdentity>,
 ) -> Result<Execution> {
     let tool_mode = tool_mode(headers)?;
     let estimated_input =
@@ -608,8 +644,11 @@ async fn execute(
         "maxOutput": max_output,
         "toolMode": tool_mode,
         "budget": budget,
+        "principal": identity.map(|identity| &identity.principal),
+        "tenant": identity.map(|identity| &identity.tenant),
+        "authScopes": identity.map(|identity| &identity.scopes),
     }));
-    let tool = maybe_execute_tool(broker, &messages, tool_mode, request_digest)?;
+    let tool = maybe_execute_tool(broker, &messages, tool_mode, request_digest, identity)?;
     let mut provider_messages = messages;
     if let Some(tool) = &tool {
         provider_messages.push(Message {
@@ -647,6 +686,7 @@ fn maybe_execute_tool(
     messages: &[Message],
     mode: ToolMode,
     causal_parent: Sha256Digest,
+    identity: Option<&AuthenticatedIdentity>,
 ) -> Result<Option<ToolExecution>> {
     if mode == ToolMode::Off {
         return Ok(None);
@@ -671,8 +711,12 @@ fn maybe_execute_tool(
         bail!("GM_TOOL_SIDE_EFFECT_DENIED");
     }
     if mode == ToolMode::Lease {
-        let principal = PrincipalId("local-model-client".into());
-        let tenant = TenantId("local".into());
+        let principal = identity
+            .map(|identity| identity.principal.clone())
+            .unwrap_or_else(|| PrincipalId("local-model-client".into()));
+        let tenant = identity
+            .map(|identity| identity.tenant.clone())
+            .unwrap_or_else(|| TenantId("local".into()));
         let lease = CapabilityLease::issue(
             principal.clone(),
             tenant.clone(),
@@ -1016,7 +1060,8 @@ mod tests {
 
     #[tokio::test]
     async fn openai_compatible_provider_adapter_forwards_to_a_real_http_fixture() {
-        async fn fixture(Json(body): Json<Value>) -> Json<Value> {
+        async fn fixture(headers: HeaderMap, Json(body): Json<Value>) -> Json<Value> {
+            assert!(headers.get(header::AUTHORIZATION).is_none());
             assert_eq!(body["model"], "upstream-model");
             Json(
                 json!({"choices":[{"message":{"content":"from upstream"}}],"usage":{"prompt_tokens":3,"completion_tokens":2}}),
@@ -1042,7 +1087,9 @@ mod tests {
             .unwrap();
         assert!(inspected.to_string().starts_with("sha256:"));
         let provider =
-            OpenAiCompatibleProvider::new(base_url.clone(), "upstream-model".into(), None).unwrap();
+            OpenAiCompatibleProvider::new(base_url.clone(), "upstream-model".into(), None)
+                .await
+                .unwrap();
         let output = provider
             .complete(
                 &[Message {
@@ -1072,6 +1119,7 @@ mod tests {
             }],
             Federation::demo(),
         )
+        .await
         .unwrap();
         let response = configured
             .oneshot(
@@ -1079,6 +1127,7 @@ mod tests {
                     .method("POST")
                     .uri("/v1/chat/completions")
                     .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer downstream-token")
                     .body(Body::from(
                         json!({"model":"reviewed-local","messages":[{"role":"user","content":"configured"}]})
                             .to_string(),

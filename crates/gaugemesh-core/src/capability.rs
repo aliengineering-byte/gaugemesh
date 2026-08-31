@@ -145,4 +145,22 @@ mod tests {
             capability("docs", "Search").native_identity_digest
         );
     }
+
+    #[test]
+    fn digest_and_readable_alias_are_observable_but_authoritatively_separate() {
+        let capability = capability("docs", "search");
+        let expected = Sha256Digest::of_json(
+            &serde_json::to_value(&capability).expect("capability serializes"),
+        );
+        assert_eq!(capability.digest(), expected);
+        assert_ne!(capability.digest(), Sha256Digest::default());
+        assert_eq!(
+            capability.readable_alias("alpha-2_beta"),
+            "docs__alpha-2_beta"
+        );
+        assert_eq!(
+            capability.readable_alias("alpha 2/beta"),
+            "docs__alpha_2_beta"
+        );
+    }
 }

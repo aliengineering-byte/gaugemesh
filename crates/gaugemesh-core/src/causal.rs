@@ -37,6 +37,9 @@ impl CausalGraph {
             return Err(CausalError::Duplicate);
         }
         if let Some(parent) = &observation.parent {
+            if parent == &observation.id {
+                return Err(CausalError::Cycle);
+            }
             if !self.parents.contains_key(parent) {
                 return Err(CausalError::MissingParent);
             }
@@ -57,5 +60,61 @@ impl CausalGraph {
 
     pub fn observations(&self) -> &[CausalObservation] {
         &self.observations
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::digest::Sha256Digest;
+
+    fn observation(id: &str, parent: Option<&str>) -> CausalObservation {
+        CausalObservation {
+            id: CausalId(id.into()),
+            parent: parent.map(|parent| CausalId(parent.into())),
+            kind: "test".into(),
+            evidence_digest: Sha256Digest::of_bytes(id),
+        }
+    }
+
+    #[test]
+    fn causal_graph_is_append_only_connected_and_acyclic() {
+        let mut graph = CausalGraph::default();
+        graph.append(observation("root", None)).unwrap();
+        graph.append(observation("child", Some("root"))).unwrap();
+        assert_eq!(graph.observations().len(), 2);
+        assert_eq!(
+            graph.append(observation("child", Some("root"))),
+            Err(CausalError::Duplicate)
+        );
+        assert_eq!(
+            graph.append(observation("orphan", Some("missing"))),
+            Err(CausalError::MissingParent)
+        );
+        assert_eq!(graph.observations().len(), 2);
+    }
+
+    #[test]
+    fn a_self_parent_is_rejected_without_mutating_the_graph() {
+        let mut graph = CausalGraph::default();
+        assert_eq!(
+            graph.append(observation("self", Some("self"))),
+            Err(CausalError::Cycle)
+        );
+        assert!(graph.observations().is_empty());
+    }
+
+    #[test]
+    fn a_parent_chain_that_reaches_the_new_node_is_rejected() {
+        let mut graph = CausalGraph::default();
+        graph
+            .parents
+            .insert(CausalId("root".into()), Some(CausalId("child".into())));
+
+        assert_eq!(
+            graph.append(observation("child", Some("root"))),
+            Err(CausalError::Cycle)
+        );
+        assert!(graph.observations().is_empty());
     }
 }

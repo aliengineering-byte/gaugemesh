@@ -5,7 +5,8 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use gaugemesh_core::digest::Sha256Digest;
+use futures_util::StreamExt;
+use gaugemesh_core::{digest::Sha256Digest, security::ResolvedOrigin};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use url::Url;
@@ -38,7 +39,7 @@ pub async fn execute(command: RegistryCommand) -> Result<()> {
     match command {
         RegistryCommand::Search { query, limit } => {
             let limit = limit.clamp(1, 100);
-            let client = registry_client()?;
+            let client = registry_client().await?;
             let mut url = Url::parse(&format!("{OFFICIAL_REGISTRY}/{API_VERSION}/servers"))?;
             url.query_pairs_mut()
                 .append_pair("search", &query)
@@ -134,7 +135,7 @@ pub async fn execute(command: RegistryCommand) -> Result<()> {
 }
 
 async fn inspect(name: &str, version: &str) -> Result<Value> {
-    let client = registry_client()?;
+    let client = registry_client().await?;
     let mut url = Url::parse(&format!("{OFFICIAL_REGISTRY}/{API_VERSION}/"))?;
     url.path_segments_mut()
         .map_err(|_| anyhow::anyhow!("GM_REGISTRY_URL"))?
@@ -142,10 +143,21 @@ async fn inspect(name: &str, version: &str) -> Result<Value> {
     get_json(&client, url).await
 }
 
-fn registry_client() -> Result<reqwest::Client> {
+async fn registry_client() -> Result<reqwest::Client> {
+    let url = Url::parse(OFFICIAL_REGISTRY)?;
+    let origin = ResolvedOrigin::resolve(&url, false)
+        .await
+        .context("GM_REGISTRY_ORIGIN_RESOLUTION")?;
+    let addresses = origin
+        .addresses
+        .iter()
+        .map(|address| std::net::SocketAddr::new(*address, origin.port))
+        .collect::<Vec<_>>();
     Ok(reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(15))
+        .resolve_to_addrs(&origin.host, &addresses)
         .user_agent(concat!("gaugemesh/", env!("CARGO_PKG_VERSION")))
         .build()?)
 }
@@ -168,9 +180,14 @@ async fn get_json(client: &reqwest::Client, url: Url) -> Result<Value> {
     {
         bail!("GM_REGISTRY_RESPONSE_TOO_LARGE");
     }
-    let bytes = response.bytes().await.context("GM_REGISTRY_BODY")?;
-    if bytes.len() > 2 * 1024 * 1024 {
-        bail!("GM_REGISTRY_RESPONSE_TOO_LARGE");
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("GM_REGISTRY_BODY")?;
+        if bytes.len().saturating_add(chunk.len()) > 2 * 1024 * 1024 {
+            bail!("GM_REGISTRY_RESPONSE_TOO_LARGE");
+        }
+        bytes.extend_from_slice(&chunk);
     }
     serde_json::from_slice(&bytes).context("GM_REGISTRY_JSON")
 }

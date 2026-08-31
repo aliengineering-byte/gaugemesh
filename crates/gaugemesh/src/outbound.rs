@@ -1,9 +1,17 @@
-use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use gaugemesh_core::{
     capability::{CapabilityId, CapabilityKind, CapabilityRevision, SourceId},
-    config::{DiscoveryMode, McpSourceConfig, McpTransportConfig},
+    config::{ApprovalConfig, DiscoveryMode, McpSourceConfig, McpTransportConfig},
     context::SideEffectClass,
     digest::Sha256Digest,
     federation::{
@@ -21,17 +29,21 @@ use rmcp::{
     },
     service::RequestContext as McpRequestContext,
     service::RunningService,
-    transport::{StreamableHttpClientTransport, TokioChildProcess},
+    transport::{
+        StreamableHttpClientTransport, TokioChildProcess,
+        streamable_http_client::StreamableHttpClientTransportConfig,
+    },
 };
 use serde::Serialize;
 use serde_json::Value;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpstreamSnapshot {
     pub protocol_revision: String,
     pub server_name: String,
+    pub capability_manifest_digest: Sha256Digest,
     pub tools: Vec<String>,
     pub resources: Vec<String>,
     pub resource_templates: Vec<String>,
@@ -46,9 +58,6 @@ async fn snapshot(peer: &Peer<RoleClient>) -> Result<UpstreamSnapshot> {
         peer.list_all_tools()
             .await
             .context("GM_MCP_UPSTREAM_TOOLS_LIST")?
-            .into_iter()
-            .map(|item| item.name.into_owned())
-            .collect()
     } else {
         Vec::new()
     };
@@ -56,9 +65,6 @@ async fn snapshot(peer: &Peer<RoleClient>) -> Result<UpstreamSnapshot> {
         peer.list_all_resources()
             .await
             .context("GM_MCP_UPSTREAM_RESOURCES_LIST")?
-            .into_iter()
-            .map(|item| item.uri)
-            .collect()
     } else {
         Vec::new()
     };
@@ -66,9 +72,6 @@ async fn snapshot(peer: &Peer<RoleClient>) -> Result<UpstreamSnapshot> {
         peer.list_all_resource_templates()
             .await
             .context("GM_MCP_UPSTREAM_RESOURCE_TEMPLATES_LIST")?
-            .into_iter()
-            .map(|item| item.uri_template)
-            .collect()
     } else {
         Vec::new()
     };
@@ -76,9 +79,6 @@ async fn snapshot(peer: &Peer<RoleClient>) -> Result<UpstreamSnapshot> {
         peer.list_all_prompts()
             .await
             .context("GM_MCP_UPSTREAM_PROMPTS_LIST")?
-            .into_iter()
-            .map(|item| item.name)
-            .collect()
     } else {
         Vec::new()
     };
@@ -88,13 +88,29 @@ async fn snapshot(peer: &Peer<RoleClient>) -> Result<UpstreamSnapshot> {
         .context("GM_MCP_UPSTREAM_MISSING_IMPLEMENTATION")?
         .name
         .clone();
+    let capability_manifest_digest = Sha256Digest::of_json(&serde_json::json!({
+        "protocolRevision": info.protocol_version,
+        "serverInfo": info.server_info,
+        "capabilities": info.capabilities,
+        "tools": tools,
+        "resources": resources,
+        "resourceTemplates": resource_templates,
+        "prompts": prompts,
+    }));
     Ok(UpstreamSnapshot {
         protocol_revision: info.protocol_version.to_string(),
         server_name,
-        tools,
-        resources,
-        resource_templates,
-        prompts,
+        capability_manifest_digest,
+        tools: tools
+            .into_iter()
+            .map(|item| item.name.into_owned())
+            .collect(),
+        resources: resources.into_iter().map(|item| item.uri).collect(),
+        resource_templates: resource_templates
+            .into_iter()
+            .map(|item| item.uri_template)
+            .collect(),
+        prompts: prompts.into_iter().map(|item| item.name).collect(),
     })
 }
 
@@ -107,12 +123,16 @@ pub async fn discover_http_revision(
     if parsed.scheme() != "http" && parsed.scheme() != "https" {
         bail!("GM_MCP_UPSTREAM_SCHEME_DENIED");
     }
-    let transport = StreamableHttpClientTransport::from_uri(uri.to_owned());
+    let transport = safe_http_transport(&parsed).await?;
     let client = tokio::time::timeout(timeout, async move {
         match revision {
-            McpRevision::V2025_11_25 => client_info(revision).serve(transport).await,
+            McpRevision::V2025_11_25 => {
+                client_info(revision, ApprovalConfig::Deny)
+                    .serve(transport)
+                    .await
+            }
             McpRevision::V2026_07_28 => {
-                client_info(revision)
+                client_info(revision, ApprovalConfig::Deny)
                     .serve_with_lifecycle(
                         transport,
                         ClientLifecycleMode::Discover {
@@ -139,17 +159,28 @@ pub async fn discover_stdio(
     revision: McpRevision,
     timeout: Duration,
 ) -> Result<UpstreamSnapshot> {
-    if !executable.is_absolute() || !allowlist.iter().any(|allowed| allowed == executable) {
+    let resolved = executable
+        .canonicalize()
+        .context("GM_MCP_EXECUTABLE_NOT_ALLOWLISTED")?;
+    let allowed = allowlist.iter().any(|allowed| {
+        allowed
+            .canonicalize()
+            .is_ok_and(|allowed| allowed == resolved)
+    });
+    if !executable.is_absolute() || !resolved.is_file() || !allowed {
         bail!("GM_MCP_EXECUTABLE_NOT_ALLOWLISTED");
     }
-    let mut command = tokio::process::Command::new(executable);
-    command.args(args).kill_on_drop(true);
+    let command = reviewed_command(&resolved, args)?;
     let transport = TokioChildProcess::new(command).context("GM_MCP_UPSTREAM_SPAWN")?;
     let client = tokio::time::timeout(timeout, async move {
         match revision {
-            McpRevision::V2025_11_25 => client_info(revision).serve(transport).await,
+            McpRevision::V2025_11_25 => {
+                client_info(revision, ApprovalConfig::Deny)
+                    .serve(transport)
+                    .await
+            }
             McpRevision::V2026_07_28 => {
-                client_info(revision)
+                client_info(revision, ApprovalConfig::Deny)
                     .serve_with_lifecycle(
                         transport,
                         ClientLifecycleMode::Discover {
@@ -172,6 +203,8 @@ pub async fn discover_stdio(
 #[derive(Clone)]
 pub(crate) struct GatewayClient {
     info: ClientInfo,
+    approval: ApprovalConfig,
+    cli_lock: Arc<Mutex<()>>,
 }
 
 impl ClientHandler for GatewayClient {
@@ -190,12 +223,10 @@ impl ClientHandler for GatewayClient {
 
     async fn create_elicitation(
         &self,
-        _request: rmcp::model::ElicitRequestParams,
+        request: rmcp::model::ElicitRequestParams,
         _context: McpRequestContext<RoleClient>,
     ) -> Result<rmcp::model::ElicitResult, McpError> {
-        Ok(rmcp::model::ElicitResult::new(
-            rmcp::model::ElicitationAction::Decline,
-        ))
+        crate::approval::handle(&self.approval, &request, &self.cli_lock).await
     }
 }
 
@@ -203,26 +234,43 @@ fn sampling_unavailable() -> McpError {
     McpError::invalid_request("GM_SAMPLING_COMPAT_DISABLED", None)
 }
 
-fn client_info(revision: McpRevision) -> GatewayClient {
+fn client_info(revision: McpRevision, approval: ApprovalConfig) -> GatewayClient {
     let protocol = match revision {
         McpRevision::V2025_11_25 => ProtocolVersion::V_2025_11_25,
         McpRevision::V2026_07_28 => ProtocolVersion::V_2026_07_28,
     };
     GatewayClient {
         info: ClientInfo::new(
-            ClientCapabilities::default(),
+            ClientCapabilities::builder()
+                .enable_elicitation()
+                .enable_elicitation_schema_validation()
+                .build(),
             Implementation::new("gaugemesh", env!("CARGO_PKG_VERSION")),
         )
         .with_protocol_version(protocol),
+        approval,
+        cli_lock: Arc::new(Mutex::new(())),
     }
 }
 
 type ActiveClient = RunningService<RoleClient, GatewayClient>;
 
 pub struct UpstreamRuntime {
-    peers: BTreeMap<String, Peer<RoleClient>>,
-    services: Mutex<Vec<ActiveClient>>,
+    sources: BTreeMap<String, Arc<ManagedSource>>,
     incomplete_sources: Vec<String>,
+    shutting_down: AtomicBool,
+}
+
+struct ManagedSource {
+    config: McpSourceConfig,
+    peer: RwLock<Peer<RoleClient>>,
+    service: Mutex<Option<ActiveClient>>,
+    expected_snapshot: Sha256Digest,
+    generation: AtomicU64,
+    restarts: AtomicU8,
+    restart_lock: Mutex<()>,
+    serialize_requests: bool,
+    request_lock: Mutex<()>,
 }
 
 impl UpstreamRuntime {
@@ -231,7 +279,57 @@ impl UpstreamRuntime {
     }
 
     pub fn contains_source(&self, source: &SourceId) -> bool {
-        self.peers.contains_key(&source.0)
+        self.sources.contains_key(&source.0)
+    }
+
+    async fn peer(&self, source: &SourceId) -> Result<(Arc<ManagedSource>, Peer<RoleClient>, u64)> {
+        let source = self
+            .sources
+            .get(&source.0)
+            .context("GM_MCP_UPSTREAM_SOURCE_UNAVAILABLE")?
+            .clone();
+        Ok((
+            source.clone(),
+            source.peer.read().await.clone(),
+            source.generation.load(Ordering::Acquire),
+        ))
+    }
+
+    async fn restart_after_failure(&self, source_id: &SourceId, observed: u64) -> Result<()> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            bail!("GM_MCP_UPSTREAM_SHUTTING_DOWN");
+        }
+        let source = self
+            .sources
+            .get(&source_id.0)
+            .context("GM_MCP_UPSTREAM_SOURCE_UNAVAILABLE")?;
+        let _restart = source.restart_lock.lock().await;
+        if source.generation.load(Ordering::Acquire) != observed {
+            return Ok(());
+        }
+        source
+            .restarts
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |restarts| {
+                (restarts < 2).then_some(restarts + 1)
+            })
+            .map_err(|_| anyhow::anyhow!("GM_MCP_UPSTREAM_RESTART_BUDGET_EXHAUSTED"))?;
+        let service = connect_source(&source.config, Duration::from_secs(10)).await?;
+        let new_snapshot = tokio::time::timeout(Duration::from_secs(10), snapshot(service.peer()))
+            .await
+            .context("GM_MCP_UPSTREAM_RESTART_DISCOVERY_TIMEOUT")??;
+        if Sha256Digest::of_json(&serde_json::to_value(&new_snapshot)?) != source.expected_snapshot
+        {
+            let _ = service.cancel().await;
+            bail!("GM_MCP_UPSTREAM_IDENTITY_CHANGED");
+        }
+        let new_peer = service.peer().clone();
+        let old = source.service.lock().await.replace(service);
+        *source.peer.write().await = new_peer;
+        source.generation.fetch_add(1, Ordering::Release);
+        if let Some(mut old) = old {
+            let _ = old.close_with_timeout(Duration::from_secs(5)).await;
+        }
+        Ok(())
     }
 
     pub async fn call_tool(
@@ -239,14 +337,25 @@ impl UpstreamRuntime {
         source: &SourceId,
         request: CallToolRequestParams,
     ) -> Result<CallToolResponse> {
-        let peer = self
-            .peers
-            .get(&source.0)
-            .context("GM_MCP_UPSTREAM_SOURCE_UNAVAILABLE")?;
-        tokio::time::timeout(Duration::from_secs(30), peer.call_tool_once(request))
-            .await
-            .context("GM_MCP_UPSTREAM_CALL_TIMEOUT")?
-            .context("GM_MCP_UPSTREAM_CALL")
+        let (managed, peer, generation) = self.peer(source).await?;
+        let _serialization = if managed.serialize_requests {
+            Some(managed.request_lock.lock().await)
+        } else {
+            None
+        };
+        let result =
+            match tokio::time::timeout(Duration::from_secs(30), peer.call_tool_once(request)).await
+            {
+                Ok(result) => result.context("GM_MCP_UPSTREAM_CALL"),
+                Err(_) => Err(anyhow::anyhow!("GM_MCP_UPSTREAM_CALL_TIMEOUT")),
+            };
+        if result.is_err() {
+            let _ = self.restart_after_failure(source, generation).await;
+        }
+        if let Ok(response) = &result {
+            reject_oversized_call_response(response)?;
+        }
+        result
     }
 
     pub async fn read_resource(
@@ -254,14 +363,26 @@ impl UpstreamRuntime {
         source: &SourceId,
         request: ReadResourceRequestParams,
     ) -> Result<ReadResourceResponse> {
-        let peer = self
-            .peers
-            .get(&source.0)
-            .context("GM_MCP_UPSTREAM_SOURCE_UNAVAILABLE")?;
-        tokio::time::timeout(Duration::from_secs(30), peer.read_resource_once(request))
-            .await
-            .context("GM_MCP_UPSTREAM_READ_TIMEOUT")?
-            .context("GM_MCP_UPSTREAM_READ")
+        let (managed, peer, generation) = self.peer(source).await?;
+        let _serialization = if managed.serialize_requests {
+            Some(managed.request_lock.lock().await)
+        } else {
+            None
+        };
+        let result =
+            match tokio::time::timeout(Duration::from_secs(30), peer.read_resource_once(request))
+                .await
+            {
+                Ok(result) => result.context("GM_MCP_UPSTREAM_READ"),
+                Err(_) => Err(anyhow::anyhow!("GM_MCP_UPSTREAM_READ_TIMEOUT")),
+            };
+        if result.is_err() {
+            let _ = self.restart_after_failure(source, generation).await;
+        }
+        if let Ok(response) = &result {
+            reject_oversized_read_response(response)?;
+        }
+        result
     }
 
     pub async fn get_prompt(
@@ -269,19 +390,37 @@ impl UpstreamRuntime {
         source: &SourceId,
         request: GetPromptRequestParams,
     ) -> Result<GetPromptResponse> {
-        let peer = self
-            .peers
-            .get(&source.0)
-            .context("GM_MCP_UPSTREAM_SOURCE_UNAVAILABLE")?;
-        tokio::time::timeout(Duration::from_secs(30), peer.get_prompt_once(request))
-            .await
-            .context("GM_MCP_UPSTREAM_PROMPT_TIMEOUT")?
-            .context("GM_MCP_UPSTREAM_PROMPT")
+        let (managed, peer, generation) = self.peer(source).await?;
+        let _serialization = if managed.serialize_requests {
+            Some(managed.request_lock.lock().await)
+        } else {
+            None
+        };
+        let result = match tokio::time::timeout(
+            Duration::from_secs(30),
+            peer.get_prompt_once(request),
+        )
+        .await
+        {
+            Ok(result) => result.context("GM_MCP_UPSTREAM_PROMPT"),
+            Err(_) => Err(anyhow::anyhow!("GM_MCP_UPSTREAM_PROMPT_TIMEOUT")),
+        };
+        if result.is_err() {
+            let _ = self.restart_after_failure(source, generation).await;
+        }
+        if let Ok(response) = &result {
+            reject_oversized_prompt_response(response)?;
+        }
+        result
     }
 
     pub async fn shutdown(&self) -> Result<()> {
-        let mut services = self.services.lock().await;
-        for service in services.iter_mut() {
+        self.shutting_down.store(true, Ordering::Release);
+        for source in self.sources.values() {
+            let _restart = source.restart_lock.lock().await;
+            let Some(mut service) = source.service.lock().await.take() else {
+                continue;
+            };
             if service
                 .close_with_timeout(Duration::from_secs(5))
                 .await
@@ -291,7 +430,6 @@ impl UpstreamRuntime {
                 bail!("GM_MCP_UPSTREAM_CLEANUP_TIMEOUT");
             }
         }
-        services.clear();
         Ok(())
     }
 }
@@ -302,25 +440,68 @@ pub async fn connect_configured_sources(
     timeout: Duration,
 ) -> Result<(Federation, Arc<UpstreamRuntime>)> {
     let mut federation = Federation::default();
-    let mut peers = BTreeMap::new();
-    let mut services = Vec::new();
+    let mut active_sources = BTreeMap::new();
     let mut incomplete_sources = Vec::new();
 
     for source in sources {
         match connect_source(source, timeout).await {
             Ok(service) => {
-                if let Err(error) =
-                    add_source_capabilities(&mut federation, source, service.peer()).await
+                let mut source_federation = Federation::default();
+                let discovered = tokio::time::timeout(timeout, async {
+                    add_source_capabilities(&mut source_federation, source, service.peer()).await?;
+                    snapshot(service.peer()).await
+                })
+                .await
+                .context("GM_MCP_UPSTREAM_DISCOVERY_TIMEOUT")
+                .and_then(|result| result);
+                let source_snapshot = match discovered {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        let _ = service.cancel().await;
+                        if mode == DiscoveryMode::Strict {
+                            return Err(error);
+                        }
+                        incomplete_sources.push(source.id.clone());
+                        continue;
+                    }
+                };
+                if source
+                    .capability_snapshot_digest
+                    .is_some_and(|expected| expected != source_snapshot.capability_manifest_digest)
                 {
                     let _ = service.cancel().await;
+                    let error = anyhow::anyhow!("GM_MCP_UPSTREAM_IDENTITY_CHANGED");
                     if mode == DiscoveryMode::Strict {
                         return Err(error);
                     }
                     incomplete_sources.push(source.id.clone());
                     continue;
                 }
-                peers.insert(source.id.clone(), service.peer().clone());
-                services.push(service);
+                if let Err(error) = federation.merge(source_federation) {
+                    let _ = service.cancel().await;
+                    if mode == DiscoveryMode::Strict {
+                        return Err(error.into());
+                    }
+                    incomplete_sources.push(source.id.clone());
+                    continue;
+                }
+                let expected_snapshot =
+                    Sha256Digest::of_json(&serde_json::to_value(&source_snapshot)?);
+                active_sources.insert(
+                    source.id.clone(),
+                    Arc::new(ManagedSource {
+                        config: source.clone(),
+                        peer: RwLock::new(service.peer().clone()),
+                        service: Mutex::new(Some(service)),
+                        expected_snapshot,
+                        generation: AtomicU64::new(1),
+                        restarts: AtomicU8::new(0),
+                        restart_lock: Mutex::new(()),
+                        serialize_requests: source.sharing
+                            == gaugemesh_core::config::SharingClass::ShareableWithSerialization,
+                        request_lock: Mutex::new(()),
+                    }),
+                );
             }
             Err(error) if mode == DiscoveryMode::Degraded => {
                 tracing::warn!(source = %source.id, error = %error, "MCP source unavailable in degraded mode");
@@ -334,9 +515,9 @@ pub async fn connect_configured_sources(
     Ok((
         federation,
         Arc::new(UpstreamRuntime {
-            peers,
-            services: Mutex::new(services),
+            sources: active_sources,
             incomplete_sources,
+            shutting_down: AtomicBool::new(false),
         }),
     ))
 }
@@ -347,17 +528,19 @@ async fn connect_source(source: &McpSourceConfig, timeout: Duration) -> Result<A
     let start = async {
         match &source.transport {
             McpTransportConfig::StreamableHttp { url } => {
-                let transport = StreamableHttpClientTransport::from_uri(url.to_string());
-                serve_client(revision, transport).await
+                let transport = safe_http_transport(url).await?;
+                serve_client(revision, source.approval.clone(), transport).await
             }
             McpTransportConfig::Stdio { command, args } => {
-                if !command.is_absolute() || !command.is_file() {
+                let resolved = command
+                    .canonicalize()
+                    .context("GM_MCP_EXECUTABLE_NOT_ALLOWLISTED")?;
+                if !command.is_absolute() || !resolved.is_file() {
                     bail!("GM_MCP_EXECUTABLE_NOT_ALLOWLISTED");
                 }
-                let mut process = tokio::process::Command::new(command);
-                process.args(args).kill_on_drop(true);
+                let process = reviewed_command(&resolved, args)?;
                 let transport = TokioChildProcess::new(process).context("GM_MCP_UPSTREAM_SPAWN")?;
-                serve_client(revision, transport).await
+                serve_client(revision, source.approval.clone(), transport).await
             }
         }
     };
@@ -366,15 +549,75 @@ async fn connect_source(source: &McpSourceConfig, timeout: Duration) -> Result<A
         .context("GM_MCP_UPSTREAM_STARTUP_TIMEOUT")?
 }
 
-async fn serve_client<T, E, A>(revision: McpRevision, transport: T) -> Result<ActiveClient>
+fn reviewed_command(executable: &Path, args: &[String]) -> Result<tokio::process::Command> {
+    let mut command = tokio::process::Command::new(executable);
+    command
+        .args(args)
+        .current_dir(executable.parent().context("GM_MCP_EXECUTABLE_DIRECTORY")?)
+        .env_clear()
+        .kill_on_drop(true);
+    for name in [
+        "PATH",
+        "SYSTEMROOT",
+        "WINDIR",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "LANG",
+        "LC_ALL",
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    Ok(command)
+}
+
+async fn safe_http_transport(
+    url: &url::Url,
+) -> Result<StreamableHttpClientTransport<reqwest::Client>> {
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(5));
+    let host = url.host_str().context("GM_MCP_UPSTREAM_URL_INVALID")?;
+    let local = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    if !matches!(url.scheme(), "http" | "https") || (url.scheme() == "http" && !local) {
+        bail!("GM_MCP_UPSTREAM_SCHEME_DENIED");
+    }
+    if !local {
+        let origin = gaugemesh_core::security::ResolvedOrigin::resolve(url, false)
+            .await
+            .context("GM_MCP_UPSTREAM_ORIGIN")?;
+        let addresses = origin
+            .addresses
+            .iter()
+            .map(|address| std::net::SocketAddr::new(*address, origin.port))
+            .collect::<Vec<_>>();
+        builder = builder.resolve_to_addrs(&origin.host, &addresses);
+    }
+    let client = builder.build().context("GM_MCP_UPSTREAM_HTTP_CLIENT")?;
+    let config = StreamableHttpClientTransportConfig::with_uri(url.to_string())
+        .max_sse_event_size(1024 * 1024)
+        .reinit_on_expired_session(false);
+    Ok(StreamableHttpClientTransport::with_client(client, config))
+}
+
+async fn serve_client<T, E, A>(
+    revision: McpRevision,
+    approval: ApprovalConfig,
+    transport: T,
+) -> Result<ActiveClient>
 where
     T: rmcp::transport::IntoTransport<RoleClient, E, A>,
     E: std::error::Error + Send + Sync + 'static,
 {
     let service = match revision {
-        McpRevision::V2025_11_25 => client_info(revision).serve(transport).await?,
+        McpRevision::V2025_11_25 => client_info(revision, approval).serve(transport).await?,
         McpRevision::V2026_07_28 => {
-            client_info(revision)
+            client_info(revision, approval)
                 .serve_with_lifecycle(
                     transport,
                     ClientLifecycleMode::Discover {
@@ -545,6 +788,38 @@ fn reject_oversized_metadata(value: &Value) -> Result<()> {
     Ok(())
 }
 
+fn reject_oversized_response(value: &impl Serialize) -> Result<()> {
+    if serde_json::to_vec(value)?.len() > 1024 * 1024 {
+        bail!("GM_MCP_UPSTREAM_RESPONSE_TOO_LARGE");
+    }
+    Ok(())
+}
+
+fn reject_oversized_call_response(value: &CallToolResponse) -> Result<()> {
+    match value {
+        CallToolResponse::Complete(result) => reject_oversized_response(result),
+        CallToolResponse::InputRequired(result) => reject_oversized_response(result),
+        CallToolResponse::Task(result) => reject_oversized_response(result),
+        _ => bail!("GM_MCP_UPSTREAM_RESPONSE_UNSUPPORTED"),
+    }
+}
+
+fn reject_oversized_read_response(value: &ReadResourceResponse) -> Result<()> {
+    match value {
+        ReadResourceResponse::Complete(result) => reject_oversized_response(result),
+        ReadResourceResponse::InputRequired(result) => reject_oversized_response(result),
+        _ => bail!("GM_MCP_UPSTREAM_RESPONSE_UNSUPPORTED"),
+    }
+}
+
+fn reject_oversized_prompt_response(value: &GetPromptResponse) -> Result<()> {
+    match value {
+        GetPromptResponse::Complete(result) => reject_oversized_response(result),
+        GetPromptResponse::InputRequired(result) => reject_oversized_response(result),
+        _ => bail!("GM_MCP_UPSTREAM_RESPONSE_UNSUPPORTED"),
+    }
+}
+
 fn bounded_text(value: &str, max_bytes: usize) -> String {
     let mut boundary = value.len().min(max_bytes);
     while !value.is_char_boundary(boundary) {
@@ -639,8 +914,10 @@ mod tests {
                 url: url::Url::parse(&format!("http://{upstream_address}/mcp")).unwrap(),
             },
             protocol_revision: "2025-11-25".into(),
+            capability_snapshot_digest: None,
             sharing: gaugemesh_core::config::SharingClass::NonShareable,
             reviewed: true,
+            approval: gaugemesh_core::config::ApprovalConfig::Deny,
         };
         let (federation, upstreams) =
             connect_configured_sources(&[source], DiscoveryMode::Strict, Duration::from_secs(5))
@@ -673,7 +950,7 @@ mod tests {
 
         let transport =
             StreamableHttpClientTransport::from_uri(format!("http://{downstream_address}/mcp"));
-        let client = client_info(McpRevision::V2026_07_28)
+        let client = client_info(McpRevision::V2026_07_28, ApprovalConfig::Deny)
             .serve_with_lifecycle(
                 transport,
                 ClientLifecycleMode::Discover {
@@ -748,6 +1025,83 @@ mod tests {
         upstream_server.await.unwrap().unwrap();
     }
 
+    #[tokio::test]
+    async fn transport_crashes_restart_for_future_requests_only_and_exhaust_the_budget() {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(
+            axum::serve(
+                listener,
+                router(MeshMcpServer::demo(), cancellation.clone()),
+            )
+            .with_graceful_shutdown({
+                let cancellation = cancellation.clone();
+                async move { cancellation.cancelled().await }
+            })
+            .into_future(),
+        );
+        let source = McpSourceConfig {
+            id: "restart-source".into(),
+            transport: McpTransportConfig::StreamableHttp {
+                url: url::Url::parse(&format!("http://{address}/mcp")).unwrap(),
+            },
+            protocol_revision: "2025-11-25".into(),
+            capability_snapshot_digest: None,
+            sharing: gaugemesh_core::config::SharingClass::ShareableStateless,
+            reviewed: true,
+            approval: ApprovalConfig::Deny,
+        };
+        let (_, upstreams) =
+            connect_configured_sources(&[source], DiscoveryMode::Strict, Duration::from_secs(5))
+                .await
+                .unwrap();
+        let source_id = SourceId("restart-source".into());
+        let managed = upstreams.sources.get(&source_id.0).unwrap();
+        for expected_restarts in 1..=2 {
+            managed
+                .service
+                .lock()
+                .await
+                .take()
+                .unwrap()
+                .cancel()
+                .await
+                .unwrap();
+            assert!(
+                upstreams
+                    .call_tool(&source_id, CallToolRequestParams::new("docs-a__search"))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(managed.restarts.load(Ordering::Acquire), expected_restarts);
+            assert_eq!(
+                managed.generation.load(Ordering::Acquire),
+                u64::from(expected_restarts) + 1
+            );
+        }
+
+        managed
+            .service
+            .lock()
+            .await
+            .take()
+            .unwrap()
+            .cancel()
+            .await
+            .unwrap();
+        assert!(
+            upstreams
+                .call_tool(&source_id, CallToolRequestParams::new("docs-a__search"))
+                .await
+                .is_err()
+        );
+        assert_eq!(managed.restarts.load(Ordering::Acquire), 2);
+        upstreams.shutdown().await.unwrap();
+        cancellation.cancel();
+        server.await.unwrap().unwrap();
+    }
+
     #[test]
     fn deprecated_sampling_is_never_silently_dropped() {
         assert_eq!(
@@ -755,11 +1109,26 @@ mod tests {
             "GM_SAMPLING_COMPAT_DISABLED"
         );
         assert!(
-            client_info(McpRevision::V2026_07_28)
+            client_info(McpRevision::V2026_07_28, ApprovalConfig::Deny)
                 .get_info()
                 .capabilities
                 .sampling
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn shell_like_arguments_remain_literal_process_arguments() {
+        let executable = std::env::current_exe().unwrap();
+        let arguments = vec!["; echo injected".into(), "$(touch should-not-exist)".into()];
+        let command = reviewed_command(&executable, &arguments).unwrap();
+        assert_eq!(
+            command
+                .as_std()
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            arguments
         );
     }
 }

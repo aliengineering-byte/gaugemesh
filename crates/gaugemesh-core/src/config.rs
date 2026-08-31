@@ -65,8 +65,23 @@ pub struct RemoteConfig {
     pub public_origin: Url,
     pub issuer: Url,
     pub audience: String,
+    pub resource: String,
+    pub jwks_url: Url,
+    pub required_scopes: Vec<String>,
+    #[serde(default = "default_jwks_cache_ttl_seconds")]
+    pub jwks_cache_ttl_seconds: u64,
+    #[serde(default = "default_clock_skew_seconds")]
+    pub clock_skew_seconds: u64,
     #[serde(default)]
     pub trusted_proxies: Vec<IpAddr>,
+}
+
+fn default_jwks_cache_ttl_seconds() -> u64 {
+    300
+}
+
+fn default_clock_skew_seconds() -> u64 {
+    30
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -83,8 +98,33 @@ pub struct McpSourceConfig {
     pub id: String,
     pub transport: McpTransportConfig,
     pub protocol_revision: String,
+    #[serde(default)]
+    pub capability_snapshot_digest: Option<crate::digest::Sha256Digest>,
     pub sharing: SharingClass,
     pub reviewed: bool,
+    #[serde(default)]
+    pub approval: ApprovalConfig,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ApprovalConfig {
+    #[default]
+    Deny,
+    StaticPolicy {
+        response: serde_json::Value,
+    },
+    LocalCli,
+    SignedWebhook {
+        url: Url,
+        secret_env: String,
+        #[serde(default = "default_approval_timeout_ms")]
+        timeout_ms: u64,
+    },
+}
+
+fn default_approval_timeout_ms() -> u64 {
+    5_000
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -145,6 +185,8 @@ pub enum ConfigError {
     InvalidLimit(String),
     #[error("GM_CONFIG_LISTENER_COLLISION")]
     ListenerCollision,
+    #[error("GM_CONFIG_REMOTE_INVALID:{0}")]
+    InvalidRemote(String),
     #[error(transparent)]
     Policy(#[from] policy::PolicyCompileError),
 }
@@ -162,8 +204,22 @@ impl Config {
         if self.listeners.remote.is_none() && (!data_ip.is_loopback() || !admin_ip.is_loopback()) {
             return Err(ConfigError::UnauthenticatedNonLoopback);
         }
+        if !admin_ip.is_loopback() {
+            return Err(ConfigError::UnauthenticatedNonLoopback);
+        }
         if self.listeners.remote.is_some() && self.policy.default != policy::PolicyEffect::Deny {
             return Err(ConfigError::RemoteDefaultAllow);
+        }
+        if let Some(remote) = &self.listeners.remote {
+            validate_remote(remote)?;
+            if self.mcp_sources.iter().any(|source| {
+                !matches!(
+                    source.sharing,
+                    SharingClass::ShareableStateless | SharingClass::ShareableWithSerialization
+                )
+            }) {
+                return Err(ConfigError::InvalidRemote("mcp_sharing".into()));
+            }
         }
         policy::compile(self.policy.clone())?;
         if self.mcp_sources.len() > 64 || self.models.len() > 64 {
@@ -184,6 +240,7 @@ impl Config {
             if !source.reviewed {
                 return Err(ConfigError::UnreviewedSource(source.id.clone()));
             }
+            validate_approval(&source.approval, &source.id)?;
             crate::protocol::McpRevision::parse(&source.protocol_revision)
                 .map_err(|_| ConfigError::Version)?;
             if let McpTransportConfig::StreamableHttp { url } = &source.transport {
@@ -221,6 +278,90 @@ impl Config {
         }
         Ok(())
     }
+}
+
+fn validate_approval(approval: &ApprovalConfig, source: &str) -> Result<(), ConfigError> {
+    match approval {
+        ApprovalConfig::Deny | ApprovalConfig::LocalCli => Ok(()),
+        ApprovalConfig::StaticPolicy { response } => {
+            if !response.is_object()
+                || serde_json::to_vec(response).map_or(true, |value| value.len() > 16 * 1024)
+            {
+                Err(ConfigError::InvalidLimit(format!("approval:{source}")))
+            } else {
+                Ok(())
+            }
+        }
+        ApprovalConfig::SignedWebhook {
+            url,
+            secret_env,
+            timeout_ms,
+        } => {
+            validate_remote_url(url, false)?;
+            if url.scheme() != "https"
+                || !(100..=10_000).contains(timeout_ms)
+                || secret_env.is_empty()
+                || secret_env.len() > 128
+                || !secret_env
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_')
+            {
+                Err(ConfigError::InvalidLimit(format!("approval:{source}")))
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
+fn validate_remote(remote: &RemoteConfig) -> Result<(), ConfigError> {
+    if !remote.tls_certificate.is_absolute() || !remote.tls_private_key.is_absolute() {
+        return Err(ConfigError::InvalidRemote("tls_path".into()));
+    }
+    validate_origin(&remote.public_origin, true, "public_origin")?;
+    validate_origin(&remote.issuer, false, "issuer")?;
+    validate_remote_url(&remote.jwks_url, false)?;
+    if remote.jwks_url.scheme() != "https" {
+        return Err(ConfigError::InvalidRemote("jwks_https".into()));
+    }
+    if remote.audience.is_empty()
+        || remote.audience.len() > 256
+        || remote.resource.is_empty()
+        || remote.resource.len() > 512
+        || remote.required_scopes.is_empty()
+        || remote.required_scopes.len() > 32
+        || remote.required_scopes.iter().any(|scope| {
+            scope.is_empty()
+                || scope.len() > 128
+                || !scope.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, ':' | '.' | '_' | '-')
+                })
+        })
+        || !(30..=86_400).contains(&remote.jwks_cache_ttl_seconds)
+        || remote.clock_skew_seconds > 300
+    {
+        return Err(ConfigError::InvalidRemote("oidc_binding".into()));
+    }
+    if remote.trusted_proxies.iter().any(|address| {
+        address.is_unspecified() || address.is_multicast() || is_link_local(*address)
+    }) {
+        return Err(ConfigError::InvalidRemote("trusted_proxy".into()));
+    }
+    Ok(())
+}
+
+fn validate_origin(url: &Url, root_only: bool, field: &str) -> Result<(), ConfigError> {
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || url.query().is_some()
+        || (root_only && url.path() != "/")
+    {
+        return Err(ConfigError::InvalidRemote(field.into()));
+    }
+    Ok(())
 }
 
 fn validate_id(id: &str) -> Result<(), ConfigError> {
@@ -328,6 +469,61 @@ mod tests {
     }
 
     #[test]
+    fn remote_mode_requires_tls_oidc_scopes_and_loopback_admin() {
+        let mut config = fixture();
+        config.listeners.data_address = "0.0.0.0:8090".into();
+        config.listeners.remote = Some(RemoteConfig {
+            tls_certificate: std::env::temp_dir().join("gaugemesh-cert.pem"),
+            tls_private_key: std::env::temp_dir().join("gaugemesh-key.pem"),
+            public_origin: Url::parse("https://mesh.example/").unwrap(),
+            issuer: Url::parse("https://issuer.example/").unwrap(),
+            audience: "gaugemesh".into(),
+            resource: "https://mesh.example/".into(),
+            jwks_url: Url::parse("https://issuer.example/.well-known/jwks.json").unwrap(),
+            required_scopes: vec!["gaugemesh:invoke".into()],
+            jwks_cache_ttl_seconds: 300,
+            clock_skew_seconds: 30,
+            trusted_proxies: Vec::new(),
+        });
+        assert!(config.validate().is_ok());
+
+        config.listeners.admin_address = "0.0.0.0:8092".into();
+        assert_eq!(
+            config.validate().unwrap_err(),
+            ConfigError::UnauthenticatedNonLoopback
+        );
+        config.listeners.admin_address = "127.0.0.1:8092".into();
+        config
+            .listeners
+            .remote
+            .as_mut()
+            .unwrap()
+            .required_scopes
+            .clear();
+        assert_eq!(
+            config.validate().unwrap_err(),
+            ConfigError::InvalidRemote("oidc_binding".into())
+        );
+        config.listeners.remote.as_mut().unwrap().required_scopes = vec!["gaugemesh:invoke".into()];
+        config.mcp_sources.push(McpSourceConfig {
+            id: "stateful".into(),
+            transport: McpTransportConfig::Stdio {
+                command: std::env::temp_dir().join("stateful-server"),
+                args: Vec::new(),
+            },
+            protocol_revision: "2026-07-28".into(),
+            capability_snapshot_digest: None,
+            sharing: SharingClass::NonShareable,
+            reviewed: true,
+            approval: ApprovalConfig::Deny,
+        });
+        assert_eq!(
+            config.validate().unwrap_err(),
+            ConfigError::InvalidRemote("mcp_sharing".into())
+        );
+    }
+
+    #[test]
     fn duplicate_ids_and_unreviewed_sources_are_rejected() {
         let mut config = fixture();
         config.mcp_sources.push(McpSourceConfig {
@@ -337,8 +533,10 @@ mod tests {
                 args: vec![],
             },
             protocol_revision: "2025-11-25".into(),
+            capability_snapshot_digest: None,
             sharing: SharingClass::NonShareable,
             reviewed: false,
+            approval: ApprovalConfig::Deny,
         });
         assert_eq!(
             config.validate().unwrap_err(),

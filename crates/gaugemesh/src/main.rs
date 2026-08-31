@@ -16,10 +16,15 @@ use gaugemesh_core::{
     storage::{LeaseStorage, MemoryStorage, SqliteStorage},
 };
 
+mod admission;
+mod approval;
+mod auth;
 mod mcp;
 mod model;
 mod outbound;
+mod policy_gate;
 mod registry;
+mod verify;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -206,9 +211,7 @@ async fn main() -> Result<()> {
         Command::Remove { id, config } => remove(&config, &id),
         Command::List { config } => list(&config),
         Command::Registry { command } => registry::execute(command).await,
-        Command::Verify { resilireplay } => {
-            bail!("GM_FEATURE_NOT_READY:verify resilireplay={resilireplay}")
-        }
+        Command::Verify { resilireplay } => verify::execute(resilireplay).await,
         Command::Connect { client, base_url } => connect(&client, &base_url),
     }
 }
@@ -274,8 +277,10 @@ async fn add(kind: AddCommand) -> Result<()> {
                 id,
                 transport,
                 protocol_revision: revision.as_str().into(),
+                capability_snapshot_digest: Some(snapshot.capability_manifest_digest),
                 sharing: SharingClass::NonShareable,
                 reviewed: true,
+                approval: gaugemesh_core::config::ApprovalConfig::Deny,
             });
             document.validate()?;
             write_config(&config, &document, Some(&contents), true)?;
@@ -525,7 +530,9 @@ async fn serve(
     let admin_address = admin_address.unwrap_or_else(|| config.listeners.admin_address.clone());
     let data_address: std::net::SocketAddr = data_address.parse()?;
     let admin_address: std::net::SocketAddr = admin_address.parse()?;
-    if !data_address.ip().is_loopback() || !admin_address.ip().is_loopback() {
+    if (config.listeners.remote.is_none() && !data_address.ip().is_loopback())
+        || !admin_address.ip().is_loopback()
+    {
         bail!("GM_CONFIG_UNAUTHENTICATED_NON_LOOPBACK");
     }
     let cancellation = tokio_util::sync::CancellationToken::new();
@@ -533,45 +540,117 @@ async fn serve(
     let model_router = if config.models.is_empty() {
         model::router()
     } else {
-        model::router_from_config(&config.models, federation)?
+        model::router_from_config(&config.models, federation).await?
     };
-    let data = mcp::router(mcp_server, cancellation.child_token()).merge(model_router);
+    let admission = std::sync::Arc::new(admission::AdmissionControl::new(
+        config.routing.max_concurrent_per_tenant,
+        config.routing.max_queue_per_tenant,
+    ));
+    let mut data = mcp::router(mcp_server, cancellation.child_token())
+        .merge(model_router)
+        .layer(axum::middleware::from_fn_with_state(
+            admission,
+            admission::limit_requests,
+        ));
+    if config.listeners.remote.is_some() {
+        let policy = std::sync::Arc::new(gaugemesh_core::policy::compile(config.policy.clone())?);
+        data = data.layer(axum::middleware::from_fn_with_state(
+            policy,
+            policy_gate::authorize,
+        ));
+    }
     let admin = Router::new().route(
         "/healthz",
         get(|| async {
             Json(serde_json::json!({"status":"ok","version":env!("CARGO_PKG_VERSION")}))
         }),
     );
-    let data_listener = tokio::net::TcpListener::bind(data_address).await?;
-    let admin_listener = tokio::net::TcpListener::bind(admin_address).await?;
-    println!("MCP endpoint: http://{data_address}/mcp");
-    println!("OpenAI-compatible endpoint: http://{data_address}/v1");
+    let scheme = if config.listeners.remote.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    println!("MCP endpoint: {scheme}://{data_address}/mcp");
+    println!("OpenAI-compatible endpoint: {scheme}://{data_address}/v1");
     println!("Admin health: http://{admin_address}/healthz");
     println!(
         "Reviewed configuration: {} MCP sources, {} model routes",
         config.mcp_sources.len(),
         config.models.len()
     );
-    let data_task = axum::serve(data_listener, data).with_graceful_shutdown({
+    let signal = {
         let cancellation = cancellation.clone();
-        async move { cancellation.cancelled().await }
-    });
-    let admin_task = axum::serve(admin_listener, admin).with_graceful_shutdown({
-        let cancellation = cancellation.clone();
-        async move { cancellation.cancelled().await }
-    });
-    tokio::select! {
-        result = data_task => result?,
-        result = admin_task => result?,
-        signal = tokio::signal::ctrl_c() => {
-            signal?;
+        async move {
+            tokio::signal::ctrl_c().await?;
             cancellation.cancel();
+            Ok::<_, anyhow::Error>(())
         }
-    }
+    };
+    let outcome = tokio::try_join!(
+        serve_data(
+            data,
+            data_address,
+            config.listeners.remote.clone(),
+            cancellation.child_token(),
+        ),
+        serve_admin(admin, admin_address, cancellation.child_token()),
+        signal,
+    );
     cancellation.cancel();
     if let Some(upstreams) = upstreams {
         upstreams.shutdown().await?;
     }
+    outcome.map(|_| ())
+}
+
+async fn serve_data(
+    data: Router,
+    address: std::net::SocketAddr,
+    remote: Option<gaugemesh_core::config::RemoteConfig>,
+    cancellation: tokio_util::sync::CancellationToken,
+) -> Result<()> {
+    if let Some(remote) = remote {
+        let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(
+            &remote.tls_certificate,
+            &remote.tls_private_key,
+        )
+        .await
+        .context("GM_CONFIG_TLS_LOAD")?;
+        let auth = std::sync::Arc::new(auth::RemoteAuthState::initialize(remote).await?);
+        let data = data.layer(axum::middleware::from_fn_with_state(
+            auth,
+            auth::authorize_remote,
+        ));
+        let handle = axum_server::Handle::new();
+        let server = axum_server::bind_rustls(address, tls)
+            .handle(handle.clone())
+            .serve(data.into_make_service_with_connect_info::<std::net::SocketAddr>());
+        tokio::pin!(server);
+        tokio::select! {
+            result = &mut server => result.context("GM_REMOTE_SERVER")?,
+            () = cancellation.cancelled() => {
+                handle.graceful_shutdown(Some(Duration::from_secs(10)));
+                server.await.context("GM_REMOTE_SERVER_SHUTDOWN")?;
+            }
+        }
+    } else {
+        let listener = tokio::net::TcpListener::bind(address).await?;
+        axum::serve(listener, data)
+            .with_graceful_shutdown(async move { cancellation.cancelled().await })
+            .await?;
+    }
+    Ok(())
+}
+
+async fn serve_admin(
+    admin: Router,
+    address: std::net::SocketAddr,
+    cancellation: tokio_util::sync::CancellationToken,
+) -> Result<()> {
+    let listener = tokio::net::TcpListener::bind(address).await?;
+    axum::serve(listener, admin)
+        .with_graceful_shutdown(async move { cancellation.cancelled().await })
+        .await?;
     Ok(())
 }
 
@@ -635,7 +714,14 @@ fn doctor(path: Option<&std::path::Path>) -> Result<()> {
     config.validate()?;
     let protocol = rmcp::model::ProtocolVersion::V_2026_07_28;
     println!("configuration: valid");
-    println!("data listener: loopback");
+    println!(
+        "data listener: {}",
+        if config.listeners.remote.is_some() {
+            "remote TLS with OIDC bearer authentication"
+        } else {
+            "loopback"
+        }
+    );
     println!("admin listener: separate loopback");
     println!("policy default: deny");
     println!("official MCP SDK protocol: {protocol}");
@@ -841,5 +927,52 @@ fn default_weights() -> RouteWeights {
         pressure: 20,
         exposure: 50,
         switching: 10,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancellation_releases_owned_data_and_admin_listeners() {
+        let data_reservation = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_reservation = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let data_address = data_reservation.local_addr().unwrap();
+        let admin_address = admin_reservation.local_addr().unwrap();
+        drop((data_reservation, admin_reservation));
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let data = tokio::spawn(serve_data(
+            Router::new().route("/", get(|| async { "ok" })),
+            data_address,
+            None,
+            cancellation.child_token(),
+        ));
+        let admin = tokio::spawn(serve_admin(
+            Router::new().route("/healthz", get(|| async { "ok" })),
+            admin_address,
+            cancellation.child_token(),
+        ));
+        let mut ready = false;
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(data_address).await.is_ok()
+                && tokio::net::TcpStream::connect(admin_address).await.is_ok()
+            {
+                ready = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(ready);
+        cancellation.cancel();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            data.await.unwrap().unwrap();
+            admin.await.unwrap().unwrap();
+        })
+        .await
+        .unwrap();
+        let data_rebound = tokio::net::TcpListener::bind(data_address).await.unwrap();
+        let admin_rebound = tokio::net::TcpListener::bind(admin_address).await.unwrap();
+        drop((data_rebound, admin_rebound));
     }
 }

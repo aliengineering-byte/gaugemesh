@@ -78,4 +78,28 @@ mod tests {
             Err(RevisionError::HeaderBodyDisagreement)
         );
     }
+
+    #[test]
+    fn every_revision_input_shape_is_validated_without_an_implicit_default() {
+        assert_eq!(
+            McpRevision::validate_request(Some(MCP_2025_11_25), None),
+            Ok(McpRevision::V2025_11_25)
+        );
+        assert_eq!(
+            McpRevision::validate_request(None, Some(MCP_2026_07_28)),
+            Ok(McpRevision::V2026_07_28)
+        );
+        assert_eq!(
+            McpRevision::validate_request(Some(MCP_2026_07_28), Some(MCP_2026_07_28)),
+            Ok(McpRevision::V2026_07_28)
+        );
+        assert_eq!(
+            McpRevision::validate_request(None, None),
+            Err(RevisionError::Unsupported)
+        );
+        assert_eq!(
+            McpRevision::validate_request(Some("2099-01-01"), None),
+            Err(RevisionError::Unsupported)
+        );
+    }
 }
