@@ -1,0 +1,5 @@
+title: GaugeMesh
+description: Semantics-preserving routing for agents, MCP servers, and models.
+theme: jekyll-theme-minimal
+exclude:
+  - releases
