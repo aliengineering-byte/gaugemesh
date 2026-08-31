@@ -1,5 +1,8 @@
 title: GaugeMesh
 description: Semantics-preserving routing for agents, MCP servers, and models.
+url: https://aliengineering-byte.github.io
+baseurl: /gaugemesh
+repository: aliengineering-byte/gaugemesh
 theme: jekyll-theme-minimal
 exclude:
   - releases
