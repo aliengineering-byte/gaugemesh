@@ -56,7 +56,7 @@ jobs:
             toolchain: stable
           - os: windows-latest
             toolchain: 1.88.0
-          - os: macos-14
+          - os: macos-15
             toolchain: stable
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45

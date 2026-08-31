@@ -1,0 +1,12 @@
+.git
+.github
+.gaugemesh
+.artifacts
+dist
+fuzz/artifacts
+fuzz/corpus
+fuzz/target
+target
+work
+**/*.log
+**/.env*
