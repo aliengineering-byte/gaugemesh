@@ -39,7 +39,7 @@ jobs:
           }
           trap cleanup EXIT
           ready=0
-          for attempt in $(seq 1 50); do
+          for _ in $(seq 1 50); do
             if curl -fsS http://127.0.0.1:18103/healthz; then ready=1; break; fi
             sleep 0.1
           done

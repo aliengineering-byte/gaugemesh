@@ -23,8 +23,14 @@ jobs:
           base="${{ github.event.pull_request.base.sha || github.event.before }}"
           if ! git cat-file -e "$base^{commit}" 2>/dev/null; then base="$(git rev-list --max-parents=0 HEAD)"; fi
           pattern="$(printf '%s' 'Y28tYXV0aG9yZWQtYnk6LiooY29kZXh8Y2xhdWRlKXxnZW5lcmF0ZWQgYnkgKGNvZGV4fGFpKXxhaS1nZW5lcmF0ZWR8YWktYXNzaXN0ZWR8YXNzaXN0YW50QHxib3RAfHJlc2lsaXJlcGxheVwubG9jYWx8aW50ZXJuYWwgZXhlY3V0aW9uIGlkfGludGVybmFsIHByb21wdCByZWZlcmVuY2V8YzpcXHVzZXJzXFx8L21udC9jL3VzZXJzL3xcLmNvZGV4' | base64 -d)"
-          ! git log "$base"..HEAD --format='%an%n%ae%n%B' | grep -Eai "$pattern"
-          ! git diff "$base"..HEAD -- . | grep -Eai "$pattern"
+          if git log "$base"..HEAD --format='%an%n%ae%n%B' | grep -Eai "$pattern"; then
+            echo "prohibited marker found in introduced commit metadata" >&2
+            exit 1
+          fi
+          if git diff "$base"..HEAD -- . | grep -Eai "$pattern"; then
+            echo "prohibited marker found in introduced content" >&2
+            exit 1
+          fi
       - name: Lint workflows with actionlint 1.7.7
         shell: bash
         run: |
@@ -100,7 +106,7 @@ jobs:
           }
           trap cleanup EXIT
           ready=0
-          for attempt in $(seq 1 100); do
+          for _ in $(seq 1 100); do
             if curl -fsS http://127.0.0.1:18123/healthz >/dev/null; then ready=1; break; fi
             sleep 0.05
           done
