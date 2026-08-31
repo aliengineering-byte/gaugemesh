@@ -1,0 +1,59 @@
+name: MCP conformance
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        revision: ["2025-11-25", "2026-07-28"]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Configure runner-native Cargo target
+        run: echo "CARGO_TARGET_DIR=$RUNNER_TEMP/gaugemesh-target" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.88.0
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - run: cargo build --locked
+      - name: Run exact requirement set
+        shell: bash
+        env:
+          GAUGEMESH_CONFORMANCE_FIXTURE: "1"
+        run: |
+          set -euo pipefail
+          "$CARGO_TARGET_DIR/debug/gaugemesh" serve --data-address 127.0.0.1:18101 --admin-address 127.0.0.1:18103 >server.log 2>&1 &
+          pid=$!
+          cleanup() {
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          ready=0
+          for attempt in $(seq 1 50); do
+            if curl -fsS http://127.0.0.1:18103/healthz; then ready=1; break; fi
+            sleep 0.1
+          done
+          test "$ready" -eq 1
+          npx -y @modelcontextprotocol/conformance@0.2.0-alpha.11 server \
+            --url http://127.0.0.1:18101/mcp \
+            --requirements "${{ matrix.revision }}" --output-dir conformance
+          cleanup
+          trap - EXIT
+          ! kill -0 "$pid" 2>/dev/null
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: conformance-${{ matrix.revision }}
+          path: |
+            conformance
+            server.log

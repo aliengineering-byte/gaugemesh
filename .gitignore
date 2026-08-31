@@ -1,4 +1,10 @@
 /target/
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/corpus/
+/fuzz/Cargo.lock
+/.artifacts/
+/mutants.out*/
 /.gaugemesh/
 /.resilireplay/
 *.db
@@ -7,4 +13,3 @@
 *.log
 .env
 .DS_Store
-
