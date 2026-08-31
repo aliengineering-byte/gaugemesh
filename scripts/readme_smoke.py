@@ -110,7 +110,7 @@ def main() -> None:
         finally:
             if server.poll() is None:
                 if os.name == "nt":
-                    server.send_signal(signal.CTRL_C_EVENT)
+                    server.send_signal(signal.CTRL_BREAK_EVENT)
                 else:
                     server.send_signal(signal.SIGINT)
             try:

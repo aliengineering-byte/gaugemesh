@@ -581,7 +581,7 @@ async fn serve(
     let signal = {
         let cancellation = cancellation.clone();
         async move {
-            tokio::signal::ctrl_c().await?;
+            shutdown_signal().await?;
             cancellation.cancel();
             Ok::<_, anyhow::Error>(())
         }
@@ -601,6 +601,26 @@ async fn serve(
         upstreams.shutdown().await?;
     }
     outcome.map(|_| ())
+}
+
+#[cfg(not(windows))]
+async fn shutdown_signal() -> Result<()> {
+    tokio::signal::ctrl_c().await?;
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn shutdown_signal() -> Result<()> {
+    let mut ctrl_break = tokio::signal::windows::ctrl_break()?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result?,
+        event = ctrl_break.recv() => {
+            if event.is_none() {
+                bail!("GM_SIGNAL_STREAM_CLOSED");
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn serve_data(
