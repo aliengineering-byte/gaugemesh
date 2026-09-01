@@ -2,10 +2,8 @@ name: Pages
 
 on:
   pull_request:
-    paths: ["README.md", "docs/**", ".github/workflows/pages.yml"]
   push:
     branches: [main]
-    paths: ["README.md", "docs/**", ".github/workflows/pages.yml"]
   workflow_dispatch:
 
 permissions:

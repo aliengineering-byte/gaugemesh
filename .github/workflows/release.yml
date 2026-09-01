@@ -3,6 +3,12 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing protected annotated release tag
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -14,24 +20,30 @@ jobs:
     outputs:
       created: ${{ steps.release.outputs.created }}
       source_sha: ${{ steps.release.outputs.source_sha }}
+      tag: ${{ steps.release.outputs.tag }}
       version: ${{ steps.release.outputs.version }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+          ref: ${{ inputs.tag || github.ref }}
       - id: release
         name: Validate public, protected, annotated release state
         shell: bash
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
           test '${{ github.event.repository.private }}' = 'false'
-          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
-          test "$(git cat-file -t "refs/tags/$GITHUB_REF_NAME")" = tag
-          source_sha="$(git rev-list -n1 "$GITHUB_REF_NAME")"
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          tag_object_sha="$(git ls-remote --tags origin "refs/tags/$RELEASE_TAG" | awk '{print $1}')"
+          source_sha="$(git ls-remote --tags origin "refs/tags/$RELEASE_TAG^{}" | awk '{print $1}')"
+          test -n "$tag_object_sha"
+          test -n "$source_sha"
+          test "$tag_object_sha" != "$source_sha"
           test "$source_sha" = "$(git rev-parse HEAD)"
-          version="${GITHUB_REF_NAME#v}"
+          version="${RELEASE_TAG#v}"
           test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)" = "$version"
           git fetch --no-tags origin main
           git merge-base --is-ancestor "$source_sha" origin/main
@@ -40,6 +52,7 @@ jobs:
           {
             echo "created=$created"
             echo "source_sha=$source_sha"
+            echo "tag=$RELEASE_TAG"
             echo "version=$version"
           } >> "$GITHUB_OUTPUT"
 
@@ -93,7 +106,7 @@ jobs:
           --source-sha "${{ needs.validate.outputs.source_sha }}"
       - run: >-
           python scripts/package_smoke.py
-          --archive "dist/gaugemesh-${{ github.ref_name }}-${{ matrix.target }}.zip"
+          --archive "dist/gaugemesh-${{ needs.validate.outputs.tag }}-${{ matrix.target }}.zip"
           --target "${{ matrix.target }}"
           --version "${{ needs.validate.outputs.version }}"
           --source-sha "${{ needs.validate.outputs.source_sha }}"
@@ -131,7 +144,7 @@ jobs:
           push: true
           platforms: linux/amd64,linux/arm64
           tags: |
-            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+            ghcr.io/${{ github.repository }}:${{ needs.validate.outputs.tag }}
             ghcr.io/${{ github.repository }}:${{ needs.validate.outputs.version }}
           labels: |
             org.opencontainers.image.created=${{ needs.validate.outputs.created }}
@@ -181,7 +194,7 @@ jobs:
         with:
           path: .
           format: spdx-json
-          output-file: dist/gaugemesh-${{ github.ref_name }}.spdx.json
+          output-file: dist/gaugemesh-${{ needs.validate.outputs.tag }}.spdx.json
           upload-artifact: false
       - run: python scripts/checksums.py
       - name: Verify generated checksums
@@ -196,7 +209,7 @@ jobs:
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           name: GaugeMesh ${{ needs.validate.outputs.version }} — Invariant Routing Developer Preview
-          body_path: docs/releases/${{ github.ref_name }}.md
+          body_path: docs/releases/${{ needs.validate.outputs.tag }}.md
           prerelease: true
           fail_on_unmatched_files: true
           files: dist/*
@@ -205,6 +218,8 @@ jobs:
     needs: [validate, publish, image]
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    env:
+      RELEASE_TAG: ${{ needs.validate.outputs.tag }}
     permissions:
       contents: read
       attestations: read
@@ -216,34 +231,34 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          git -c credential.helper= clone --branch "$GITHUB_REF_NAME" --depth 1 \
+          git -c credential.helper= clone --branch "$RELEASE_TAG" --depth 1 \
             "https://github.com/${GITHUB_REPOSITORY}.git" "$RUNNER_TEMP/public-gaugemesh"
           mkdir -p "$RUNNER_TEMP/public-release"
-          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}"
           for file in \
-            "gaugemesh-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.zip" \
-            "gaugemesh-${GITHUB_REF_NAME}.spdx.json" \
+            "gaugemesh-${RELEASE_TAG}-x86_64-unknown-linux-gnu.zip" \
+            "gaugemesh-${RELEASE_TAG}.spdx.json" \
             SHA256SUMS; do
             curl --fail --location --retry 8 --retry-all-errors \
               "$base/$file" --output "$RUNNER_TEMP/public-release/$file"
           done
           cd "$RUNNER_TEMP/public-release"
-          gh attestation verify "gaugemesh-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.zip" --repo "$GITHUB_REPOSITORY"
-          gh attestation verify "gaugemesh-${GITHUB_REF_NAME}.spdx.json" --repo "$GITHUB_REPOSITORY"
+          gh attestation verify "gaugemesh-${RELEASE_TAG}-x86_64-unknown-linux-gnu.zip" --repo "$GITHUB_REPOSITORY"
+          gh attestation verify "gaugemesh-${RELEASE_TAG}.spdx.json" --repo "$GITHUB_REPOSITORY"
           gh attestation verify SHA256SUMS --repo "$GITHUB_REPOSITORY"
           grep -E 'x86_64-unknown-linux-gnu|spdx' SHA256SUMS | sha256sum --check
           python "$RUNNER_TEMP/public-gaugemesh/scripts/package_smoke.py" \
-            --archive "gaugemesh-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.zip" \
+            --archive "gaugemesh-${RELEASE_TAG}-x86_64-unknown-linux-gnu.zip" \
             --target x86_64-unknown-linux-gnu \
-            --version "${GITHUB_REF_NAME#v}" \
+            --version "${RELEASE_TAG#v}" \
             --source-sha "${{ needs.validate.outputs.source_sha }}"
-          unzip -q "gaugemesh-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.zip" -d install
+          unzip -q "gaugemesh-${RELEASE_TAG}-x86_64-unknown-linux-gnu.zip" -d install
           chmod +x install/gaugemesh
       - name: Pull the public GHCR image without credentials
         shell: bash
         run: |
           set -euo pipefail
-          image="ghcr.io/${GITHUB_REPOSITORY}:${GITHUB_REF_NAME}"
+          image="ghcr.io/${GITHUB_REPOSITORY}:${RELEASE_TAG}"
           docker pull "$image"
           docker run --rm --platform linux/amd64 "$image" --version
           docker run --rm --platform linux/arm64 "$image" --version
