@@ -204,10 +204,21 @@ jobs:
           docker buildx imagetools inspect "$image@$digest" --raw | \
             jq -e '[.manifests[] | select(.platform.os == "linux") | .platform.architecture] | unique | sort == ["amd64", "arm64"]'
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
-      - name: Make the repository-linked developer-preview image public
+      - name: Verify anonymous access to the public developer-preview image
+        shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh api --method PATCH /user/packages/container/gaugemesh -f visibility=public
+          IMAGE: ghcr.io/${{ github.repository }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          repository="${IMAGE#ghcr.io/}"
+          token="$(curl --fail --silent --show-error \
+            "https://ghcr.io/token?service=ghcr.io&scope=repository:${repository}:pull" | \
+            jq -er '.token')"
+          curl --fail --silent --show-error --head \
+            -H "Authorization: Bearer $token" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json' \
+            "https://ghcr.io/v2/${repository}/manifests/${TAG}" | \
+            grep -i '^docker-content-digest:'
       - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
           subject-name: ghcr.io/${{ github.repository }}
