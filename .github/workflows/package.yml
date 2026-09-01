@@ -1,0 +1,150 @@
+name: Package acceptance
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  archive:
+    name: archive (${{ matrix.os }}, ${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            binary: gaugemesh
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            binary: gaugemesh
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            binary: gaugemesh.exe
+          - os: macos-15
+            target: aarch64-apple-darwin
+            binary: gaugemesh
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: gaugemesh
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Keep build output outside the checkout
+        shell: bash
+        run: echo "CARGO_TARGET_DIR=$RUNNER_TEMP/gaugemesh-target" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.88.0
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - name: Build the native release binary
+        run: cargo build --locked --release --target ${{ matrix.target }} --bin gaugemesh
+      - name: Verify the checked-in demo transcript
+        run: >-
+          python scripts/verify_readme.py
+          --binary "${{ env.CARGO_TARGET_DIR }}/${{ matrix.target }}/release/${{ matrix.binary }}"
+      - name: Execute the clean README configuration journey
+        run: >-
+          python scripts/readme_smoke.py
+          --binary "${{ env.CARGO_TARGET_DIR }}/${{ matrix.target }}/release/${{ matrix.binary }}"
+      - name: Package the exact source revision
+        run: >-
+          python scripts/package.py
+          --binary "${{ env.CARGO_TARGET_DIR }}/${{ matrix.target }}/release/${{ matrix.binary }}"
+          --target "${{ matrix.target }}"
+          --version 0.1.0
+          --source-sha "${{ env.SOURCE_SHA }}"
+      - name: Extract and execute the archive
+        run: >-
+          python scripts/package_smoke.py
+          --archive "dist/gaugemesh-v0.1.0-${{ matrix.target }}.zip"
+          --target "${{ matrix.target }}"
+          --version 0.1.0
+          --source-sha "${{ env.SOURCE_SHA }}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: package-${{ matrix.target }}
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  source-sbom:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: gaugemesh-v0.1.0.spdx.json
+          upload-artifact: false
+      - name: Validate the SPDX document
+        run: python -c "import json; d=json.load(open('gaugemesh-v0.1.0.spdx.json', encoding='utf-8')); assert d['spdxVersion'].startswith('SPDX-2.')"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: source-sbom
+          path: gaugemesh-v0.1.0.spdx.json
+          if-no-files-found: error
+          retention-days: 7
+
+  openai-sdk:
+    needs: archive
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: package-x86_64-unknown-linux-gnu
+          path: package
+      - name: Run the official OpenAI Python SDK 3.6.0 against GaugeMesh
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/gaugemesh-sdk"
+          unzip -q package/*.zip -d "$RUNNER_TEMP/gaugemesh-sdk"
+          binary="$RUNNER_TEMP/gaugemesh-sdk/gaugemesh"
+          chmod +x "$binary"
+          python -m venv "$RUNNER_TEMP/openai-sdk"
+          "$RUNNER_TEMP/openai-sdk/bin/pip" install --disable-pip-version-check openai==3.6.0
+          log="$RUNNER_TEMP/gaugemesh-openai-sdk.log"
+          "$binary" serve --data-address 127.0.0.1:18141 --admin-address 127.0.0.1:18143 >"$log" 2>&1 &
+          pid=$!
+          cleanup() {
+            kill -INT "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          ready=0
+          for _ in $(seq 1 100); do
+            if curl -fsS http://127.0.0.1:18143/healthz >/dev/null; then ready=1; break; fi
+            sleep 0.05
+          done
+          test "$ready" -eq 1
+          "$RUNNER_TEMP/openai-sdk/bin/python" scripts/openai_sdk_smoke.py --base-url http://127.0.0.1:18141/v1
+          cleanup
+          trap - EXIT
+          if kill -0 "$pid" 2>/dev/null; then exit 1; fi
+          if ss -ltn | grep -Eq ':(18141|18143)[[:space:]]'; then exit 1; fi
+
+  container-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Build the optional non-root container
+        run: docker build --pull --tag gaugemesh:smoke .
+      - run: docker run --rm gaugemesh:smoke --version
+      - name: Run the no-key demo in the container
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm gaugemesh:smoke demo --json > "$RUNNER_TEMP/container-demo.json"
+          python -c "import json,os; d=json.load(open(os.environ['RUNNER_TEMP'] + '/container-demo.json')); assert d['status']=='PASS' and d['ownedChildrenRemaining']==0 and d['ownedListenersRemaining']==0"

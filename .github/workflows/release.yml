@@ -1,0 +1,323 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      created: ${{ steps.release.outputs.created }}
+      source_sha: ${{ steps.release.outputs.source_sha }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - id: release
+        name: Validate public, protected, annotated release state
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test '${{ github.event.repository.private }}' = 'false'
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(git cat-file -t "refs/tags/$GITHUB_REF_NAME")" = tag
+          source_sha="$(git rev-list -n1 "$GITHUB_REF_NAME")"
+          test "$source_sha" = "$(git rev-parse HEAD)"
+          version="${GITHUB_REF_NAME#v}"
+          test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)" = "$version"
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$source_sha" origin/main
+          python scripts/verify_repository_rules.py --repository "$GITHUB_REPOSITORY"
+          created="$(git show -s --format=%cI "$source_sha")"
+          {
+            echo "created=$created"
+            echo "source_sha=$source_sha"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+
+  binaries:
+    needs: validate
+    name: binary (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            binary: gaugemesh
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            binary: gaugemesh
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            binary: gaugemesh.exe
+          - os: macos-15
+            target: aarch64-apple-darwin
+            binary: gaugemesh
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: gaugemesh
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.validate.outputs.source_sha }}
+      - name: Keep build output outside the checkout
+        shell: bash
+        run: echo "CARGO_TARGET_DIR=$RUNNER_TEMP/gaugemesh-target" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.88.0
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - run: cargo build --locked --release --target ${{ matrix.target }} --bin gaugemesh
+      - run: >-
+          python scripts/verify_readme.py
+          --binary "${{ env.CARGO_TARGET_DIR }}/${{ matrix.target }}/release/${{ matrix.binary }}"
+      - run: >-
+          python scripts/readme_smoke.py
+          --binary "${{ env.CARGO_TARGET_DIR }}/${{ matrix.target }}/release/${{ matrix.binary }}"
+      - run: >-
+          python scripts/package.py
+          --binary "${{ env.CARGO_TARGET_DIR }}/${{ matrix.target }}/release/${{ matrix.binary }}"
+          --target "${{ matrix.target }}"
+          --version "${{ needs.validate.outputs.version }}"
+          --source-sha "${{ needs.validate.outputs.source_sha }}"
+      - run: >-
+          python scripts/package_smoke.py
+          --archive "dist/gaugemesh-${{ github.ref_name }}-${{ matrix.target }}.zip"
+          --target "${{ matrix.target }}"
+          --version "${{ needs.validate.outputs.version }}"
+          --source-sha "${{ needs.validate.outputs.source_sha }}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  image:
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.validate.outputs.source_sha }}
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+            ghcr.io/${{ github.repository }}:${{ needs.validate.outputs.version }}
+          labels: |
+            org.opencontainers.image.created=${{ needs.validate.outputs.created }}
+            org.opencontainers.image.description=Semantics-preserving routing for agents, MCP servers, and models.
+            org.opencontainers.image.licenses=Apache-2.0
+            org.opencontainers.image.revision=${{ needs.validate.outputs.source_sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.title=GaugeMesh
+            org.opencontainers.image.version=${{ needs.validate.outputs.version }}
+          provenance: mode=max
+          sbom: true
+      - name: Make the repository-linked developer-preview image public
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api --method PATCH /user/packages/container/gaugemesh -f visibility=public
+      - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+      - name: Execute both published image architectures
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY}@${{ steps.push.outputs.digest }}"
+          docker run --rm --platform linux/amd64 "$image" --version
+          docker run --rm --platform linux/arm64 "$image" --version
+
+  publish:
+    needs: [validate, binaries, image]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.validate.outputs.source_sha }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: dist/gaugemesh-${{ github.ref_name }}.spdx.json
+          upload-artifact: false
+      - run: python scripts/checksums.py
+      - name: Verify generated checksums
+        working-directory: dist
+        run: sha256sum --check SHA256SUMS
+      - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: |
+            dist/*.zip
+            dist/*.json
+            dist/SHA256SUMS
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          name: GaugeMesh ${{ needs.validate.outputs.version }} — Invariant Routing Developer Preview
+          body_path: docs/releases/${{ github.ref_name }}.md
+          prerelease: true
+          fail_on_unmatched_files: true
+          files: dist/*
+
+  public-install:
+    needs: [validate, publish, image]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      attestations: read
+    steps:
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - name: Clone and download without repository credentials
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git -c credential.helper= clone --branch "$GITHUB_REF_NAME" --depth 1 \
+            "https://github.com/${GITHUB_REPOSITORY}.git" "$RUNNER_TEMP/public-gaugemesh"
+          mkdir -p "$RUNNER_TEMP/public-release"
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
+          for file in \
+            "gaugemesh-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.zip" \
+            "gaugemesh-${GITHUB_REF_NAME}.spdx.json" \
+            SHA256SUMS; do
+            curl --fail --location --retry 8 --retry-all-errors \
+              "$base/$file" --output "$RUNNER_TEMP/public-release/$file"
+          done
+          cd "$RUNNER_TEMP/public-release"
+          gh attestation verify "gaugemesh-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.zip" --repo "$GITHUB_REPOSITORY"
+          gh attestation verify "gaugemesh-${GITHUB_REF_NAME}.spdx.json" --repo "$GITHUB_REPOSITORY"
+          gh attestation verify SHA256SUMS --repo "$GITHUB_REPOSITORY"
+          grep -E 'x86_64-unknown-linux-gnu|spdx' SHA256SUMS | sha256sum --check
+          python "$RUNNER_TEMP/public-gaugemesh/scripts/package_smoke.py" \
+            --archive "gaugemesh-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.zip" \
+            --target x86_64-unknown-linux-gnu \
+            --version "${GITHUB_REF_NAME#v}" \
+            --source-sha "${{ needs.validate.outputs.source_sha }}"
+          unzip -q "gaugemesh-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.zip" -d install
+          chmod +x install/gaugemesh
+      - name: Pull the public GHCR image without credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY}:${GITHUB_REF_NAME}"
+          docker pull "$image"
+          docker run --rm --platform linux/amd64 "$image" --version
+          docker run --rm --platform linux/arm64 "$image" --version
+      - name: Re-run public OpenAI SDK and MCP client paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="$RUNNER_TEMP/public-release/install/gaugemesh"
+          source="$RUNNER_TEMP/public-gaugemesh"
+          python -m venv "$RUNNER_TEMP/public-openai-sdk"
+          "$RUNNER_TEMP/public-openai-sdk/bin/pip" install --disable-pip-version-check openai==3.6.0
+          server_pid=''
+          cleanup() {
+            if test -n "$server_pid"; then
+              kill -INT "$server_pid" 2>/dev/null || true
+              wait "$server_pid" 2>/dev/null || true
+            fi
+          }
+          trap cleanup EXIT
+          run_server() {
+            if test "$1" = 1; then
+              GAUGEMESH_CONFORMANCE_FIXTURE=1 "$binary" serve \
+                --data-address 127.0.0.1:18151 --admin-address 127.0.0.1:18153 \
+                >"$RUNNER_TEMP/public-server.log" 2>&1 &
+            else
+              "$binary" serve \
+                --data-address 127.0.0.1:18151 --admin-address 127.0.0.1:18153 \
+                >"$RUNNER_TEMP/public-server.log" 2>&1 &
+            fi
+            server_pid=$!
+            ready=0
+            for _ in $(seq 1 100); do
+              if curl -fsS http://127.0.0.1:18153/healthz >/dev/null; then ready=1; break; fi
+              sleep 0.05
+            done
+            test "$ready" -eq 1
+          }
+          stop_server() {
+            kill -INT "$server_pid" 2>/dev/null || true
+            wait "$server_pid" 2>/dev/null || true
+            if kill -0 "$server_pid" 2>/dev/null; then exit 1; fi
+            server_pid=''
+          }
+          run_server 0
+          "$RUNNER_TEMP/public-openai-sdk/bin/python" "$source/scripts/openai_sdk_smoke.py" \
+            --base-url http://127.0.0.1:18151/v1
+          stop_server
+          for revision in 2025-11-25 2026-07-28; do
+            run_server 1
+            npx -y @modelcontextprotocol/conformance@0.2.0-alpha.11 server \
+              --url http://127.0.0.1:18151/mcp \
+              --requirements "$revision" \
+              --output-dir "$RUNNER_TEMP/public-conformance-$revision"
+            stop_server
+          done
+          "$binary" verify --resilireplay | tee "$RUNNER_TEMP/public-resilireplay.log"
+          if ss -ltn | grep -Eq ':(18151|18153)[[:space:]]'; then exit 1; fi
+          trap - EXIT
+      - name: Verify the published Pages surface
+        shell: bash
+        run: |
+          set -euo pipefail
+          page="$RUNNER_TEMP/public-page.html"
+          curl --fail --location --retry 12 --retry-delay 5 --retry-all-errors \
+            https://aliengineering-byte.github.io/gaugemesh/ --output "$page"
+          grep -Fq 'GaugeMesh developer preview' "$page"
+          grep -Fq 'not a production-readiness' "$page"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: public-install-verification
+          path: |
+            ${{ runner.temp }}/public-server.log
+            ${{ runner.temp }}/public-resilireplay.log
+            ${{ runner.temp }}/public-conformance-*
+          if-no-files-found: warn
+          retention-days: 30
