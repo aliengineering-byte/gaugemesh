@@ -229,7 +229,10 @@ jobs:
         run: |
           set -euo pipefail
           image="ghcr.io/${GITHUB_REPOSITORY}@${{ steps.manifest.outputs.digest }}"
+          docker pull --platform linux/amd64 "$image"
           docker run --rm --platform linux/amd64 "$image" --version
+          docker image rm "$image"
+          docker pull --platform linux/arm64 "$image"
           docker run --rm --platform linux/arm64 "$image" --version
 
   publish:
@@ -318,8 +321,10 @@ jobs:
         run: |
           set -euo pipefail
           image="ghcr.io/${GITHUB_REPOSITORY}:${RELEASE_TAG}"
-          docker pull "$image"
+          docker pull --platform linux/amd64 "$image"
           docker run --rm --platform linux/amd64 "$image" --version
+          docker image rm "$image"
+          docker pull --platform linux/arm64 "$image"
           docker run --rm --platform linux/arm64 "$image" --version
       - name: Re-run public OpenAI SDK and MCP client paths
         shell: bash
