@@ -1,8 +1,65 @@
+use std::process::Command;
+
 use rmcp::{
     ClientLifecycleMode, ClientServiceExt, ServiceExt,
     model::{ClientCapabilities, ClientInfo, Implementation, ProtocolVersion},
     transport::TokioChildProcess,
 };
+
+#[test]
+fn route_explain_preserves_the_v0_bare_plan_shape_by_default() {
+    let output = Command::new(env!("CARGO_BIN_EXE_gaugemesh"))
+        .args(["route", "explain"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value.as_object().unwrap().len(), 6);
+    assert_eq!(value["selected"], "local-a");
+    assert!(value.get("action_score").is_some());
+    assert!(value.get("explanation").is_some());
+    assert!(value.get("snapshot_digest").is_some());
+    assert!(value.get("route_policy_digest").is_some());
+    assert!(value.get("metric_snapshot_digest").is_some());
+    assert!(value.get("status").is_none());
+    assert!(value.get("plan").is_none());
+}
+
+#[test]
+fn route_explain_emits_an_explicit_no_eligible_decision() {
+    let output = Command::new(env!("CARGO_BIN_EXE_gaugemesh"))
+        .args(["route", "explain", "--deny-all"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["status"], "denied");
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(
+        value["denial"]["code"],
+        "GM_ROUTE_NO_ELIGIBLE_CANDIDATE"
+    );
+    assert!(value["denial"]["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|candidate| candidate["allowed"] == false
+            && candidate["terms"].is_null()
+            && !candidate["rejections"].as_array().unwrap().is_empty()));
+}
+
+#[test]
+fn route_explain_selected_contract_is_explicitly_opt_in() {
+    let output = Command::new(env!("CARGO_BIN_EXE_gaugemesh"))
+        .args(["route", "explain", "--decision-contract"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["status"], "selected");
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["plan"]["selected"], "local-a");
+}
 
 fn client(version: ProtocolVersion) -> ClientInfo {
     ClientInfo::new(

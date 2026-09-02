@@ -2,6 +2,13 @@
 
 All notable changes are documented here.
 
+## Unreleased
+
+- Add an opt-in, versioned route-decision contract for selected routes and a
+  digest-bound denial contract that reports every hard-constraint rejection
+  when no route is eligible. The default `route explain` JSON remains the
+  original `0.1.0` bare-plan shape for existing machine consumers.
+
 ## 0.1.0 - 2026-08-30
 
 - Add the typed invariant core, deterministic route explanations, capability

@@ -66,6 +66,17 @@ Evidence: sha256:beff1b394239b0993d0082e86f4acceb9726975a8cf07c8442c5a2fffdd269d
 The demo is deterministic fixture evidence, not a production-duration soak or
 security certification.
 
+Inspect the route planner and its versioned decision contract independently.
+The final command uses a built-in fixture in which every candidate violates a
+hard constraint, so the output is a digest-bound `denied` decision rather than
+an unsafe fallback:
+
+```sh
+gaugemesh route explain
+gaugemesh route explain --decision-contract
+gaugemesh route explain --deny-all
+```
+
 ## Architecture
 
 ```text
@@ -206,9 +217,15 @@ explicit approval backend.
 5. Queue pressure, retry dissipation, and breaker hysteresis use ordinary,
    falsifiable software definitions. No physics analogy overrides the code.
 
-Run `gaugemesh route explain` for accepted and rejected candidates, integer score
-terms, the stable tie breaker, and policy/metric snapshot digests. The analogy
-boundary is documented in [the physics model](docs/architecture/PHYSICS_MODEL.md).
+Run `gaugemesh route explain` for the original `0.1.0` bare plan containing
+accepted and rejected candidates, integer score terms, the stable tie breaker,
+and policy/metric snapshot digests. Existing machine consumers retain that
+shape. Opt into the versioned `selected` wrapper with `--decision-contract`.
+`gaugemesh route explain --deny-all` returns the new contract with
+`status: "denied"`, stable
+`GM_ROUTE_NO_ELIGIBLE_CANDIDATE`, every constraint rejection, and the snapshot
+digests. The analogy boundary is documented in
+[the physics model](docs/architecture/PHYSICS_MODEL.md).
 
 ## Safety boundaries
 
@@ -286,8 +303,12 @@ conformance, ResiliReplay, an SPDX SBOM, checksums, attestations, container smok
 and clean archive execution.
 
 Contributions must preserve typed invariants and include a test able to falsify
-the change. See [CONTRIBUTING.md](CONTRIBUTING.md). Report vulnerabilities through
-GitHub private vulnerability reporting, not a public issue.
+the change. See [CONTRIBUTING.md](CONTRIBUTING.md). Found a problem? Submit a
+[sanitized reproducible bug](https://github.com/aliengineering-byte/gaugemesh/issues/new?template=bug.yml),
+or share an integration and use case through the
+[issue chooser](https://github.com/aliengineering-byte/gaugemesh/issues/new/choose).
+Report vulnerabilities through GitHub private vulnerability reporting, not a
+public issue.
 
 ## License
 

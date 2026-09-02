@@ -12,7 +12,9 @@ use gaugemesh_core::{
         RoutingConfig, RuntimeConfig, SharingClass,
     },
     policy::{PolicyDocument, PolicyEffect},
-    route::{ConstraintResult, RouteCandidate, RouteId, RouteMetricSnapshot, RouteWeights, plan},
+    route::{
+        ConstraintResult, RouteCandidate, RouteId, RouteMetricSnapshot, RouteWeights, decide, plan,
+    },
     storage::{LeaseStorage, MemoryStorage, SqliteStorage},
 };
 
@@ -161,7 +163,14 @@ enum AddCommand {
 
 #[derive(Debug, Subcommand)]
 enum RouteCommand {
-    Explain,
+    Explain {
+        /// Use the credential-free fixture where every route violates a hard constraint.
+        #[arg(long)]
+        deny_all: bool,
+        /// Wrap the selected plan in the versioned route-decision contract.
+        #[arg(long)]
+        decision_contract: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -191,8 +200,12 @@ async fn main() -> Result<()> {
         Command::Init { path, force } => initialize(path, force),
         Command::Doctor { config } => doctor(config.as_deref()),
         Command::Route {
-            command: RouteCommand::Explain,
-        } => explain_route(),
+            command:
+                RouteCommand::Explain {
+                    deny_all,
+                    decision_contract,
+                },
+        } => explain_route(deny_all, decision_contract),
         Command::Schema => {
             println!(
                 "{}",
@@ -876,7 +889,7 @@ fn connect(client: &str, base_url: &url::Url) -> Result<()> {
     Ok(())
 }
 
-fn explain_route() -> Result<()> {
+fn explain_route(deny_all: bool, decision_contract: bool) -> Result<()> {
     let mut rejected = candidate("remote-over-budget", 1);
     rejected.hard_constraints = ConstraintResult {
         allowed: false,
@@ -885,11 +898,25 @@ fn explain_route() -> Result<()> {
             "required semantic field unavailable".into(),
         ],
     };
-    let plan = plan(
-        vec![candidate("local-b", 30), candidate("local-a", 20), rejected],
-        default_weights(),
-    )?;
-    println!("{}", serde_json::to_string_pretty(&plan)?);
+    let mut candidates = vec![candidate("local-b", 30), candidate("local-a", 20), rejected];
+    if deny_all {
+        for candidate in &mut candidates {
+            if candidate.hard_constraints.allowed {
+                candidate.hard_constraints.allowed = false;
+                candidate.hard_constraints.rejections = match candidate.route_id.0.as_str() {
+                    "local-a" => vec!["required capability unavailable".into()],
+                    _ => vec!["tenant scope mismatch".into()],
+                };
+            }
+        }
+    }
+    if deny_all || decision_contract {
+        let decision = decide(candidates, default_weights())?;
+        println!("{}", serde_json::to_string_pretty(&decision)?);
+    } else {
+        let plan = plan(candidates, default_weights())?;
+        println!("{}", serde_json::to_string_pretty(&plan)?);
+    }
     Ok(())
 }
 

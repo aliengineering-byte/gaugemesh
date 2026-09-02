@@ -121,6 +121,32 @@ pub struct RoutePlan {
     pub metric_snapshot_digest: Sha256Digest,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub enum RouteDenialCode {
+    #[serde(rename = "GM_ROUTE_NO_ELIGIBLE_CANDIDATE")]
+    NoEligibleCandidate,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteDenial {
+    pub code: RouteDenialCode,
+    pub candidates: Vec<CandidateExplanation>,
+    pub snapshot_digest: Sha256Digest,
+    pub route_policy_digest: Sha256Digest,
+    pub metric_snapshot_digest: Sha256Digest,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum RouteDecision {
+    Selected { schema_version: u16, plan: RoutePlan },
+    Denied {
+        schema_version: u16,
+        denial: RouteDenial,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum RouteError {
     #[error("GM_ROUTE_NO_ELIGIBLE_CANDIDATE")]
@@ -130,9 +156,19 @@ pub enum RouteError {
 }
 
 pub fn plan(
-    mut candidates: Vec<RouteCandidate>,
+    candidates: Vec<RouteCandidate>,
     weights: RouteWeights,
 ) -> Result<RoutePlan, RouteError> {
+    match decide(candidates, weights)? {
+        RouteDecision::Selected { plan, .. } => Ok(plan),
+        RouteDecision::Denied { .. } => Err(RouteError::NoEligibleCandidate),
+    }
+}
+
+pub fn decide(
+    mut candidates: Vec<RouteCandidate>,
+    weights: RouteWeights,
+) -> Result<RouteDecision, RouteError> {
     if [
         weights.latency,
         weights.cost,
@@ -203,21 +239,32 @@ pub fn plan(
         });
     }
     eligible.sort();
-    let (action_score, selected) = eligible
-        .first()
-        .cloned()
-        .ok_or(RouteError::NoEligibleCandidate)?;
-    Ok(RoutePlan {
-        selected: selected.clone(),
-        action_score,
-        explanation: RouteExplanation {
-            candidates: explanation,
-            selected,
-            tie_breaker: "lexicographically smallest stable route_id".into(),
+    let Some((action_score, selected)) = eligible.first().cloned() else {
+        return Ok(RouteDecision::Denied {
+            schema_version: 1,
+            denial: RouteDenial {
+                code: RouteDenialCode::NoEligibleCandidate,
+                candidates: explanation,
+                snapshot_digest,
+                route_policy_digest,
+                metric_snapshot_digest,
+            },
+        });
+    };
+    Ok(RouteDecision::Selected {
+        schema_version: 1,
+        plan: RoutePlan {
+            selected: selected.clone(),
+            action_score,
+            explanation: RouteExplanation {
+                candidates: explanation,
+                selected,
+                tie_breaker: "lexicographically smallest stable route_id".into(),
+            },
+            snapshot_digest,
+            route_policy_digest,
+            metric_snapshot_digest,
         },
-        snapshot_digest,
-        route_policy_digest,
-        metric_snapshot_digest,
     })
 }
 
@@ -277,6 +324,67 @@ mod tests {
                 .unwrap()
                 .selected,
             RouteId("b".into())
+        );
+    }
+
+    #[test]
+    fn all_rejected_candidates_return_a_digest_bound_denial() {
+        let mut tenant_mismatch = candidate("tenant-mismatch");
+        tenant_mismatch.hard_constraints = ConstraintResult {
+            allowed: false,
+            rejections: vec!["tenant scope mismatch".into()],
+        };
+        let mut budget_exhausted = candidate("budget-exhausted");
+        budget_exhausted.hard_constraints = ConstraintResult {
+            allowed: false,
+            rejections: vec!["monetary budget exhausted".into()],
+        };
+
+        assert_eq!(
+            plan(
+                vec![tenant_mismatch.clone(), budget_exhausted.clone()],
+                weights(),
+            ),
+            Err(RouteError::NoEligibleCandidate)
+        );
+        let first = decide(
+            vec![tenant_mismatch.clone(), budget_exhausted.clone()],
+            weights(),
+        )
+        .unwrap();
+        let second = decide(vec![budget_exhausted, tenant_mismatch], weights()).unwrap();
+        assert_eq!(first, second);
+        let RouteDecision::Denied {
+            schema_version,
+            denial,
+        } = first
+        else {
+            panic!("all rejected candidates must deny");
+        };
+        assert_eq!(schema_version, 1);
+        assert_eq!(denial.code, RouteDenialCode::NoEligibleCandidate);
+        assert_eq!(denial.candidates[0].route_id.0, "budget-exhausted");
+        assert_eq!(
+            denial.candidates[0].rejections,
+            vec!["monetary budget exhausted"]
+        );
+        assert_eq!(denial.candidates[1].route_id.0, "tenant-mismatch");
+        assert_eq!(
+            denial.candidates[1].rejections,
+            vec!["tenant scope mismatch"]
+        );
+        assert!(denial.candidates.iter().all(|candidate| {
+            !candidate.allowed && candidate.terms.is_none() && !candidate.rejections.is_empty()
+        }));
+        let encoded = serde_json::to_value(RouteDecision::Denied {
+            schema_version,
+            denial,
+        })
+        .unwrap();
+        assert_eq!(encoded["status"], "denied");
+        assert_eq!(
+            encoded["denial"]["code"],
+            "GM_ROUTE_NO_ELIGIBLE_CANDIDATE"
         );
     }
 
