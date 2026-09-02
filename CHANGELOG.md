@@ -4,6 +4,16 @@ All notable changes are documented here.
 
 ## Unreleased
 
+## 0.2.1 - 2026-09-02
+
+- Correct the public selected/denied decision examples to use shell redirection
+  rather than an unsupported `--output` option.
+- Publish consistent `0.2.1` workspace identities and crates.io metadata for
+  the `gaugemesh-core` and `gaugemesh` crates.
+- Add fail-closed first-publication package inspection and dry-run evidence.
+
+## 0.2.0 - 2026-09-02
+
 - Add an opt-in, versioned route-decision contract for selected routes and a
   digest-bound denial contract that reports every hard-constraint rejection
   when no route is eligible. The default `route explain` JSON remains the
@@ -12,7 +22,7 @@ All notable changes are documented here.
   ordering, and bind the complete selected/denied payload with an unsigned,
   recomputable decision digest.
 - Add a checked-in decision JSON Schema and offline `route validate` command.
-- Bump the unreleased workspace/package identity to `0.2.0` and update package
+- Bump the workspace/package identity to `0.2.0` and update package
   acceptance artifacts accordingly.
 - Upgrade all workflow checkout pins from immutable v4 to immutable v6 commits.
 

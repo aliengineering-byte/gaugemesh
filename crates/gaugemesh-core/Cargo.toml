@@ -5,7 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/gaugemesh-core"
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Invariant and deterministic routing core for GaugeMesh"
+publish = ["crates-io"]
 
 [dependencies]
 argon2.workspace = true
