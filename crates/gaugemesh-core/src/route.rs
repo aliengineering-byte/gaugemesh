@@ -4,6 +4,10 @@ use thiserror::Error;
 
 use crate::digest::Sha256Digest;
 
+/// Maximum generated score term: normalized weight 10_000 × normalized metric 10_000.
+pub const MAX_SCORE_TERM: u64 = 100_000_000;
+pub const MAX_ACTION_SCORE: u64 = 7 * MAX_SCORE_TERM;
+
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct RouteId(pub String);
@@ -82,14 +86,23 @@ pub struct ScoreTerms {
 }
 
 impl ScoreTerms {
-    pub fn total(&self) -> u64 {
-        self.latency
-            + self.cost
-            + self.failure
-            + self.semantic_loss
-            + self.pressure
-            + self.exposure
-            + self.switching
+    pub fn total(&self) -> Result<u64, RouteError> {
+        let terms = [
+            self.latency,
+            self.cost,
+            self.failure,
+            self.semantic_loss,
+            self.pressure,
+            self.exposure,
+            self.switching,
+        ];
+        if terms.into_iter().any(|term| term > MAX_SCORE_TERM) {
+            return Err(RouteError::DecisionScoreOutOfRange);
+        }
+        terms
+            .into_iter()
+            .try_fold(0_u64, u64::checked_add)
+            .ok_or(RouteError::DecisionScoreOutOfRange)
     }
 }
 
@@ -121,18 +134,154 @@ pub struct RoutePlan {
     pub metric_snapshot_digest: Sha256Digest,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub enum RouteDenialCode {
+    #[serde(rename = "GM_ROUTE_NO_ELIGIBLE_CANDIDATE")]
+    NoEligibleCandidate,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteDenial {
+    pub code: RouteDenialCode,
+    pub candidates: Vec<CandidateExplanation>,
+    pub snapshot_digest: Sha256Digest,
+    pub route_policy_digest: Sha256Digest,
+    pub metric_snapshot_digest: Sha256Digest,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RouteDecision {
+    Selected {
+        schema_version: u16,
+        decision_digest: Sha256Digest,
+        plan: RoutePlan,
+    },
+    Denied {
+        schema_version: u16,
+        decision_digest: Sha256Digest,
+        denial: RouteDenial,
+    },
+}
+
+impl RouteDecision {
+    pub fn decision_digest(&self) -> Sha256Digest {
+        match self {
+            Self::Selected {
+                decision_digest, ..
+            }
+            | Self::Denied {
+                decision_digest, ..
+            } => *decision_digest,
+        }
+    }
+
+    pub fn verify_integrity(&self) -> Result<(), RouteError> {
+        let (schema_version, explanations) = match self {
+            Self::Selected {
+                schema_version,
+                decision_digest,
+                plan,
+            } => {
+                if *decision_digest != selected_digest(*schema_version, plan) {
+                    return Err(RouteError::DecisionDigestMismatch);
+                }
+                if plan.action_score > MAX_ACTION_SCORE {
+                    return Err(RouteError::DecisionScoreOutOfRange);
+                }
+                if plan.selected != plan.explanation.selected {
+                    return Err(RouteError::DecisionContractInvalid);
+                }
+                if plan.explanation.tie_breaker != "lexicographically smallest stable route_id" {
+                    return Err(RouteError::DecisionContractInvalid);
+                }
+                let selected = plan
+                    .explanation
+                    .candidates
+                    .iter()
+                    .find(|candidate| candidate.route_id == plan.selected)
+                    .ok_or(RouteError::DecisionContractInvalid)?;
+                let selected_score = selected
+                    .terms
+                    .as_ref()
+                    .ok_or(RouteError::DecisionContractInvalid)?
+                    .total()?;
+                if !selected.allowed {
+                    return Err(RouteError::DecisionContractInvalid);
+                }
+                if !selected.rejections.is_empty() {
+                    return Err(RouteError::DecisionContractInvalid);
+                }
+                if selected_score != plan.action_score {
+                    return Err(RouteError::DecisionContractInvalid);
+                }
+                let mut ranked = Vec::new();
+                for candidate in &plan.explanation.candidates {
+                    if let Some(terms) = &candidate.terms {
+                        ranked.push((terms.total()?, candidate.route_id.clone()));
+                    }
+                }
+                ranked.sort();
+                if ranked.first() != Some(&(plan.action_score, plan.selected.clone())) {
+                    return Err(RouteError::DecisionContractInvalid);
+                }
+                (*schema_version, &plan.explanation.candidates)
+            }
+            Self::Denied {
+                schema_version,
+                decision_digest,
+                denial,
+            } => {
+                if *decision_digest != denied_digest(*schema_version, denial) {
+                    return Err(RouteError::DecisionDigestMismatch);
+                }
+                (*schema_version, &denial.candidates)
+            }
+        };
+        if schema_version != 1 {
+            return Err(RouteError::UnsupportedDecisionSchema);
+        }
+        validate_explanations(explanations, matches!(self, Self::Denied { .. }))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum RouteError {
     #[error("GM_ROUTE_NO_ELIGIBLE_CANDIDATE")]
     NoEligibleCandidate,
     #[error("GM_ROUTE_METRIC_OUT_OF_RANGE")]
     MetricOutOfRange,
+    #[error("GM_ROUTE_DUPLICATE_ROUTE_ID")]
+    DuplicateRouteId,
+    #[error("GM_ROUTE_INVALID_ROUTE_ID")]
+    InvalidRouteId,
+    #[error("GM_ROUTE_REJECTION_REQUIRED")]
+    RejectionRequired,
+    #[error("GM_ROUTE_DECISION_DIGEST_MISMATCH")]
+    DecisionDigestMismatch,
+    #[error("GM_ROUTE_DECISION_CONTRACT_INVALID")]
+    DecisionContractInvalid,
+    #[error("GM_ROUTE_DECISION_SCORE_OUT_OF_RANGE")]
+    DecisionScoreOutOfRange,
+    #[error("GM_ROUTE_DECISION_SCHEMA_UNSUPPORTED")]
+    UnsupportedDecisionSchema,
 }
 
 pub fn plan(
-    mut candidates: Vec<RouteCandidate>,
+    candidates: Vec<RouteCandidate>,
     weights: RouteWeights,
 ) -> Result<RoutePlan, RouteError> {
+    match decide(candidates, weights)? {
+        RouteDecision::Selected { plan, .. } => Ok(plan),
+        RouteDecision::Denied { .. } => Err(RouteError::NoEligibleCandidate),
+    }
+}
+
+pub fn decide(
+    mut candidates: Vec<RouteCandidate>,
+    weights: RouteWeights,
+) -> Result<RouteDecision, RouteError> {
     if [
         weights.latency,
         weights.cost,
@@ -150,7 +299,34 @@ pub fn plan(
     {
         return Err(RouteError::MetricOutOfRange);
     }
+    if candidates
+        .iter()
+        .any(|candidate| candidate.route_id.0.is_empty())
+    {
+        return Err(RouteError::InvalidRouteId);
+    }
     candidates.sort_by(|left, right| left.route_id.cmp(&right.route_id));
+    if candidates
+        .windows(2)
+        .any(|pair| pair[0].route_id == pair[1].route_id)
+    {
+        return Err(RouteError::DuplicateRouteId);
+    }
+    for candidate in &mut candidates {
+        if !candidate.hard_constraints.allowed {
+            if candidate.hard_constraints.rejections.is_empty()
+                || candidate
+                    .hard_constraints
+                    .rejections
+                    .iter()
+                    .any(|rejection| rejection.trim().is_empty())
+            {
+                return Err(RouteError::RejectionRequired);
+            }
+            candidate.hard_constraints.rejections.sort();
+            candidate.hard_constraints.rejections.dedup();
+        }
+    }
     let snapshot_digest = Sha256Digest::of_json(
         &serde_json::to_value((&candidates, weights)).expect("route snapshot serializes"),
     );
@@ -194,7 +370,7 @@ pub fn plan(
             exposure: u64::from(weights.exposure) * u64::from(metric.exposure),
             switching: u64::from(weights.switching) * u64::from(metric.switching),
         };
-        eligible.push((terms.total(), candidate.route_id.clone()));
+        eligible.push((terms.total()?, candidate.route_id.clone()));
         explanation.push(CandidateExplanation {
             route_id: candidate.route_id.clone(),
             allowed: true,
@@ -203,11 +379,23 @@ pub fn plan(
         });
     }
     eligible.sort();
-    let (action_score, selected) = eligible
-        .first()
-        .cloned()
-        .ok_or(RouteError::NoEligibleCandidate)?;
-    Ok(RoutePlan {
+    let Some((action_score, selected)) = eligible.first().cloned() else {
+        let schema_version = 1;
+        let denial = RouteDenial {
+            code: RouteDenialCode::NoEligibleCandidate,
+            candidates: explanation,
+            snapshot_digest,
+            route_policy_digest,
+            metric_snapshot_digest,
+        };
+        return Ok(RouteDecision::Denied {
+            schema_version,
+            decision_digest: denied_digest(schema_version, &denial),
+            denial,
+        });
+    };
+    let schema_version = 1;
+    let plan = RoutePlan {
         selected: selected.clone(),
         action_score,
         explanation: RouteExplanation {
@@ -218,7 +406,78 @@ pub fn plan(
         snapshot_digest,
         route_policy_digest,
         metric_snapshot_digest,
+    };
+    Ok(RouteDecision::Selected {
+        schema_version,
+        decision_digest: selected_digest(schema_version, &plan),
+        plan,
     })
+}
+
+fn selected_digest(schema_version: u16, plan: &RoutePlan) -> Sha256Digest {
+    Sha256Digest::of_json(&serde_json::json!({
+        "status": "selected",
+        "schema_version": schema_version,
+        "plan": plan,
+    }))
+}
+
+fn denied_digest(schema_version: u16, denial: &RouteDenial) -> Sha256Digest {
+    Sha256Digest::of_json(&serde_json::json!({
+        "status": "denied",
+        "schema_version": schema_version,
+        "denial": denial,
+    }))
+}
+
+fn validate_explanations(
+    explanations: &[CandidateExplanation],
+    require_all_denied: bool,
+) -> Result<(), RouteError> {
+    if explanations
+        .windows(2)
+        .any(|pair| pair[0].route_id >= pair[1].route_id)
+    {
+        return Err(RouteError::DecisionContractInvalid);
+    }
+    for candidate in explanations {
+        if candidate.route_id.0.is_empty() {
+            return Err(RouteError::DecisionContractInvalid);
+        }
+        if candidate.allowed {
+            if require_all_denied {
+                return Err(RouteError::DecisionContractInvalid);
+            }
+            if !candidate.rejections.is_empty() {
+                return Err(RouteError::DecisionContractInvalid);
+            }
+            if candidate.terms.is_none() {
+                return Err(RouteError::DecisionContractInvalid);
+            }
+            continue;
+        }
+        if candidate.terms.is_some() {
+            return Err(RouteError::DecisionContractInvalid);
+        }
+        if candidate.rejections.is_empty() {
+            return Err(RouteError::DecisionContractInvalid);
+        }
+        if candidate
+            .rejections
+            .iter()
+            .any(|rejection| rejection.trim().is_empty())
+        {
+            return Err(RouteError::DecisionContractInvalid);
+        }
+        if candidate
+            .rejections
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(RouteError::DecisionContractInvalid);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -257,6 +516,211 @@ mod tests {
         }
     }
 
+    fn score_terms() -> ScoreTerms {
+        ScoreTerms {
+            latency: 10,
+            cost: 30,
+            failure: 30,
+            semantic_loss: 0,
+            pressure: 20,
+            exposure: 50,
+            switching: 10,
+        }
+    }
+
+    fn allowed_explanation(id: &str) -> CandidateExplanation {
+        CandidateExplanation {
+            route_id: RouteId(id.into()),
+            allowed: true,
+            rejections: vec![],
+            terms: Some(score_terms()),
+        }
+    }
+
+    fn denied_explanation(id: &str, rejections: &[&str]) -> CandidateExplanation {
+        CandidateExplanation {
+            route_id: RouteId(id.into()),
+            allowed: false,
+            rejections: rejections
+                .iter()
+                .map(|rejection| (*rejection).into())
+                .collect(),
+            terms: None,
+        }
+    }
+
+    fn refresh_selected_digest(decision: &mut RouteDecision) {
+        let RouteDecision::Selected {
+            schema_version,
+            decision_digest,
+            plan,
+        } = decision
+        else {
+            panic!("candidate must be selected");
+        };
+        *decision_digest = selected_digest(*schema_version, plan);
+    }
+
+    fn assert_selected_contract_invalid(mutator: impl FnOnce(&mut RoutePlan)) {
+        let mut decision = decide(vec![candidate("selected")], weights()).unwrap();
+        let RouteDecision::Selected { plan, .. } = &mut decision else {
+            panic!("candidate must be selected");
+        };
+        mutator(plan);
+        refresh_selected_digest(&mut decision);
+        assert_eq!(
+            decision.verify_integrity(),
+            Err(RouteError::DecisionContractInvalid)
+        );
+    }
+
+    #[test]
+    fn maximum_action_score_is_valid_digest_bound_and_exposed() {
+        let mut at_limit = candidate("at-limit");
+        at_limit.metrics = RouteMetricSnapshot {
+            latency: 10_000,
+            cost: 10_000,
+            failure: 10_000,
+            pressure: 10_000,
+            exposure: 10_000,
+            switching: 10_000,
+        };
+        at_limit.semantic_loss = 10_000;
+        let limit_weights = RouteWeights {
+            latency: 10_000,
+            cost: 10_000,
+            failure: 10_000,
+            semantic_loss: 10_000,
+            pressure: 10_000,
+            exposure: 10_000,
+            switching: 10_000,
+        };
+        let decision = decide(vec![at_limit], limit_weights).unwrap();
+        let RouteDecision::Selected {
+            schema_version,
+            decision_digest,
+            plan,
+        } = &decision
+        else {
+            panic!("candidate must be selected");
+        };
+        let terms = plan.explanation.candidates[0].terms.as_ref().unwrap();
+        assert_eq!(terms.total(), Ok(MAX_ACTION_SCORE));
+        assert_eq!(plan.action_score, MAX_ACTION_SCORE);
+        assert_eq!(*decision_digest, selected_digest(*schema_version, plan));
+        assert_ne!(*decision_digest, Sha256Digest::default());
+        assert_eq!(decision.decision_digest(), *decision_digest);
+        assert_eq!(decision.verify_integrity(), Ok(()));
+    }
+
+    #[test]
+    fn selected_metadata_and_ranking_invariants_fail_independently() {
+        assert_selected_contract_invalid(|plan| {
+            plan.explanation.selected = RouteId("different".into());
+        });
+        assert_selected_contract_invalid(|plan| {
+            plan.explanation.tie_breaker = "unstable input order".into();
+        });
+        assert_selected_contract_invalid(|plan| {
+            plan.action_score += 1;
+        });
+        assert_selected_contract_invalid(|plan| {
+            plan.explanation.candidates[0].allowed = false;
+        });
+        assert_selected_contract_invalid(|plan| {
+            plan.explanation.candidates[0].rejections = vec!["not eligible".into()];
+        });
+        assert_selected_contract_invalid(|plan| {
+            plan.explanation.candidates[0].terms = None;
+        });
+
+        let mut non_winner = decide(vec![candidate("b"), candidate("a")], weights()).unwrap();
+        let RouteDecision::Selected { plan, .. } = &mut non_winner else {
+            panic!("candidate must be selected");
+        };
+        plan.selected = RouteId("b".into());
+        plan.explanation.selected = RouteId("b".into());
+        refresh_selected_digest(&mut non_winner);
+        assert_eq!(
+            non_winner.verify_integrity(),
+            Err(RouteError::DecisionContractInvalid)
+        );
+    }
+
+    #[test]
+    fn explanation_contract_covers_order_and_field_permutations() {
+        let allowed_a = allowed_explanation("a");
+        let allowed_b = allowed_explanation("b");
+        assert_eq!(
+            validate_explanations(&[allowed_a.clone(), allowed_b.clone()], false),
+            Ok(())
+        );
+        assert_eq!(
+            validate_explanations(&[allowed_b.clone(), allowed_a.clone()], false),
+            Err(RouteError::DecisionContractInvalid)
+        );
+        assert_eq!(
+            validate_explanations(&[allowed_a.clone(), allowed_a.clone()], false),
+            Err(RouteError::DecisionContractInvalid)
+        );
+        assert_eq!(
+            validate_explanations(&[allowed_a.clone()], true),
+            Err(RouteError::DecisionContractInvalid)
+        );
+
+        let mut allowed_with_rejection = allowed_a.clone();
+        allowed_with_rejection.rejections = vec!["unexpected".into()];
+        assert_eq!(
+            validate_explanations(&[allowed_with_rejection], false),
+            Err(RouteError::DecisionContractInvalid)
+        );
+        let mut allowed_without_terms = allowed_a;
+        allowed_without_terms.terms = None;
+        assert_eq!(
+            validate_explanations(&[allowed_without_terms], false),
+            Err(RouteError::DecisionContractInvalid)
+        );
+
+        let denied_a = denied_explanation("a", &["a reason", "z reason"]);
+        let denied_b = denied_explanation("b", &["reason"]);
+        assert_eq!(
+            validate_explanations(&[denied_a.clone(), denied_b], true),
+            Ok(())
+        );
+        let mut denied_with_terms = denied_a.clone();
+        denied_with_terms.terms = Some(score_terms());
+        assert_eq!(
+            validate_explanations(&[denied_with_terms], true),
+            Err(RouteError::DecisionContractInvalid)
+        );
+        assert_eq!(
+            validate_explanations(&[denied_explanation("empty", &[])], true),
+            Err(RouteError::DecisionContractInvalid)
+        );
+        assert_eq!(
+            validate_explanations(&[denied_explanation("blank", &["   "])], true),
+            Err(RouteError::DecisionContractInvalid)
+        );
+        assert_eq!(
+            validate_explanations(
+                &[denied_explanation("unsorted", &["z reason", "a reason"])],
+                true,
+            ),
+            Err(RouteError::DecisionContractInvalid)
+        );
+        assert_eq!(
+            validate_explanations(
+                &[denied_explanation("duplicate", &["reason", "reason"])],
+                true,
+            ),
+            Err(RouteError::DecisionContractInvalid)
+        );
+        assert_eq!(
+            validate_explanations(&[denied_explanation("", &["reason"])], true),
+            Err(RouteError::DecisionContractInvalid)
+        );
+    }
+
     #[test]
     fn reordering_does_not_change_route() {
         let first = plan(vec![candidate("b"), candidate("a")], weights()).unwrap();
@@ -277,6 +741,129 @@ mod tests {
                 .unwrap()
                 .selected,
             RouteId("b".into())
+        );
+    }
+
+    #[test]
+    fn all_rejected_candidates_return_a_digest_bound_denial() {
+        let mut tenant_mismatch = candidate("tenant-mismatch");
+        tenant_mismatch.hard_constraints = ConstraintResult {
+            allowed: false,
+            rejections: vec!["tenant scope mismatch".into()],
+        };
+        let mut budget_exhausted = candidate("budget-exhausted");
+        budget_exhausted.hard_constraints = ConstraintResult {
+            allowed: false,
+            rejections: vec!["monetary budget exhausted".into()],
+        };
+
+        assert_eq!(
+            plan(
+                vec![tenant_mismatch.clone(), budget_exhausted.clone()],
+                weights(),
+            ),
+            Err(RouteError::NoEligibleCandidate)
+        );
+        let first = decide(
+            vec![tenant_mismatch.clone(), budget_exhausted.clone()],
+            weights(),
+        )
+        .unwrap();
+        let second = decide(vec![budget_exhausted, tenant_mismatch], weights()).unwrap();
+        assert_eq!(first, second);
+        let RouteDecision::Denied {
+            schema_version,
+            denial,
+            ..
+        } = first
+        else {
+            panic!("all rejected candidates must deny");
+        };
+        assert_eq!(schema_version, 1);
+        assert_eq!(denial.code, RouteDenialCode::NoEligibleCandidate);
+        assert_eq!(denial.candidates[0].route_id.0, "budget-exhausted");
+        assert_eq!(
+            denial.candidates[0].rejections,
+            vec!["monetary budget exhausted"]
+        );
+        assert_eq!(denial.candidates[1].route_id.0, "tenant-mismatch");
+        assert_eq!(
+            denial.candidates[1].rejections,
+            vec!["tenant scope mismatch"]
+        );
+        assert!(denial.candidates.iter().all(|candidate| {
+            !candidate.allowed && candidate.terms.is_none() && !candidate.rejections.is_empty()
+        }));
+        let decision_digest = denied_digest(schema_version, &denial);
+        let encoded = serde_json::to_value(RouteDecision::Denied {
+            schema_version,
+            decision_digest,
+            denial,
+        })
+        .unwrap();
+        assert_eq!(encoded["status"], "denied");
+        assert_eq!(encoded["denial"]["code"], "GM_ROUTE_NO_ELIGIBLE_CANDIDATE");
+        assert!(
+            encoded["decision_digest"]
+                .as_str()
+                .unwrap()
+                .starts_with("sha256:")
+        );
+    }
+
+    #[test]
+    fn duplicate_route_ids_and_unexplained_denials_fail_closed() {
+        assert_eq!(
+            decide(
+                vec![candidate("duplicate"), candidate("duplicate")],
+                weights(),
+            ),
+            Err(RouteError::DuplicateRouteId)
+        );
+        let mut unexplained = candidate("unexplained");
+        unexplained.hard_constraints.allowed = false;
+        assert_eq!(
+            decide(vec![unexplained], weights()),
+            Err(RouteError::RejectionRequired)
+        );
+        assert_eq!(
+            decide(vec![candidate("")], weights()),
+            Err(RouteError::InvalidRouteId)
+        );
+        let mut blank = candidate("blank");
+        blank.hard_constraints = ConstraintResult {
+            allowed: false,
+            rejections: vec!["   ".into()],
+        };
+        assert_eq!(
+            decide(vec![blank], weights()),
+            Err(RouteError::RejectionRequired)
+        );
+    }
+
+    #[test]
+    fn denial_reason_order_is_canonical_and_tampering_is_detected() {
+        let mut denied = candidate("denied");
+        denied.hard_constraints = ConstraintResult {
+            allowed: false,
+            rejections: vec!["z reason".into(), "a reason".into(), "z reason".into()],
+        };
+        let decision = decide(vec![denied], weights()).unwrap();
+        decision.verify_integrity().unwrap();
+        let RouteDecision::Denied { denial, .. } = &decision else {
+            panic!("candidate must be denied");
+        };
+        assert_eq!(
+            denial.candidates[0].rejections,
+            vec!["a reason".to_string(), "z reason".to_string()]
+        );
+
+        let mut value = serde_json::to_value(decision).unwrap();
+        value["denial"]["candidates"][0]["rejections"][0] = "tampered".into();
+        let tampered: RouteDecision = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            tampered.verify_integrity(),
+            Err(RouteError::DecisionDigestMismatch)
         );
     }
 
@@ -340,7 +927,7 @@ mod tests {
             exposure: 13,
             switching: 17,
         };
-        assert_eq!(terms.total(), 58);
+        assert_eq!(terms.total(), Ok(58));
 
         let candidate = RouteCandidate {
             route_id: RouteId("only".into()),
@@ -379,6 +966,83 @@ mod tests {
             switching: 559,
         };
         assert_eq!(plan.explanation.candidates[0].terms, Some(expected.clone()));
-        assert_eq!(plan.action_score, expected.total());
+        assert_eq!(plan.action_score, expected.total().unwrap());
+    }
+
+    fn external_decision_with_scores(latency: u64, cost: u64) -> RouteDecision {
+        let decision = decide(vec![candidate("external")], weights()).unwrap();
+        let mut value = serde_json::to_value(decision).unwrap();
+        value["plan"]["explanation"]["candidates"][0]["terms"]["latency"] = latency.into();
+        value["plan"]["explanation"]["candidates"][0]["terms"]["cost"] = cost.into();
+        let mut external: RouteDecision = serde_json::from_value(value).unwrap();
+        let RouteDecision::Selected {
+            schema_version,
+            decision_digest,
+            plan,
+        } = &mut external
+        else {
+            panic!("candidate must be selected");
+        };
+        *decision_digest = selected_digest(*schema_version, plan);
+        external
+    }
+
+    #[test]
+    fn external_score_overflow_and_out_of_range_terms_fail_closed() {
+        let overflow = external_decision_with_scores(u64::MAX, 1);
+        assert_eq!(
+            overflow.verify_integrity(),
+            Err(RouteError::DecisionScoreOutOfRange)
+        );
+
+        let out_of_range = external_decision_with_scores(MAX_SCORE_TERM + 1, 0);
+        assert_eq!(
+            out_of_range.verify_integrity(),
+            Err(RouteError::DecisionScoreOutOfRange)
+        );
+
+        let decision = decide(vec![candidate("external")], weights()).unwrap();
+        let mut value = serde_json::to_value(decision).unwrap();
+        value["plan"]["action_score"] = (MAX_ACTION_SCORE + 1).into();
+        let mut out_of_range_score: RouteDecision = serde_json::from_value(value).unwrap();
+        let RouteDecision::Selected {
+            schema_version,
+            decision_digest,
+            plan,
+        } = &mut out_of_range_score
+        else {
+            panic!("candidate must be selected");
+        };
+        *decision_digest = selected_digest(*schema_version, plan);
+        assert_eq!(
+            out_of_range_score.verify_integrity(),
+            Err(RouteError::DecisionScoreOutOfRange)
+        );
+    }
+
+    #[test]
+    fn checked_in_schema_matches_generated_score_bounds() {
+        let schema: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../schemas/gaugemesh-route-decision-v1.schema.json"
+        ))
+        .unwrap();
+        for term in [
+            "latency",
+            "cost",
+            "failure",
+            "semantic_loss",
+            "pressure",
+            "exposure",
+            "switching",
+        ] {
+            assert_eq!(
+                schema["$defs"]["scoreTerms"]["properties"][term]["maximum"],
+                MAX_SCORE_TERM
+            );
+        }
+        assert_eq!(
+            schema["$defs"]["routePlan"]["properties"]["action_score"]["maximum"],
+            MAX_ACTION_SCORE
+        );
     }
 }
