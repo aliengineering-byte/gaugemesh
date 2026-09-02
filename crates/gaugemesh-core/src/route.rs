@@ -190,9 +190,10 @@ impl RouteDecision {
                 if plan.action_score > MAX_ACTION_SCORE {
                     return Err(RouteError::DecisionScoreOutOfRange);
                 }
-                if plan.selected != plan.explanation.selected
-                    || plan.explanation.tie_breaker != "lexicographically smallest stable route_id"
-                {
+                if plan.selected != plan.explanation.selected {
+                    return Err(RouteError::DecisionContractInvalid);
+                }
+                if plan.explanation.tie_breaker != "lexicographically smallest stable route_id" {
                     return Err(RouteError::DecisionContractInvalid);
                 }
                 let selected = plan
@@ -206,10 +207,13 @@ impl RouteDecision {
                     .as_ref()
                     .ok_or(RouteError::DecisionContractInvalid)?
                     .total()?;
-                if !selected.allowed
-                    || !selected.rejections.is_empty()
-                    || selected_score != plan.action_score
-                {
+                if !selected.allowed {
+                    return Err(RouteError::DecisionContractInvalid);
+                }
+                if !selected.rejections.is_empty() {
+                    return Err(RouteError::DecisionContractInvalid);
+                }
+                if selected_score != plan.action_score {
                     return Err(RouteError::DecisionContractInvalid);
                 }
                 let mut ranked = Vec::new();
@@ -441,19 +445,34 @@ fn validate_explanations(
             return Err(RouteError::DecisionContractInvalid);
         }
         if candidate.allowed {
-            if require_all_denied || !candidate.rejections.is_empty() || candidate.terms.is_none() {
+            if require_all_denied {
                 return Err(RouteError::DecisionContractInvalid);
             }
-        } else if candidate.terms.is_some()
-            || candidate.rejections.is_empty()
-            || candidate
-                .rejections
-                .iter()
-                .any(|rejection| rejection.trim().is_empty())
-            || candidate
-                .rejections
-                .windows(2)
-                .any(|pair| pair[0] >= pair[1])
+            if !candidate.rejections.is_empty() {
+                return Err(RouteError::DecisionContractInvalid);
+            }
+            if candidate.terms.is_none() {
+                return Err(RouteError::DecisionContractInvalid);
+            }
+            continue;
+        }
+        if candidate.terms.is_some() {
+            return Err(RouteError::DecisionContractInvalid);
+        }
+        if candidate.rejections.is_empty() {
+            return Err(RouteError::DecisionContractInvalid);
+        }
+        if candidate
+            .rejections
+            .iter()
+            .any(|rejection| rejection.trim().is_empty())
+        {
+            return Err(RouteError::DecisionContractInvalid);
+        }
+        if candidate
+            .rejections
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
         {
             return Err(RouteError::DecisionContractInvalid);
         }
@@ -495,6 +514,211 @@ mod tests {
             exposure: 50,
             switching: 10,
         }
+    }
+
+    fn score_terms() -> ScoreTerms {
+        ScoreTerms {
+            latency: 10,
+            cost: 30,
+            failure: 30,
+            semantic_loss: 0,
+            pressure: 20,
+            exposure: 50,
+            switching: 10,
+        }
+    }
+
+    fn allowed_explanation(id: &str) -> CandidateExplanation {
+        CandidateExplanation {
+            route_id: RouteId(id.into()),
+            allowed: true,
+            rejections: vec![],
+            terms: Some(score_terms()),
+        }
+    }
+
+    fn denied_explanation(id: &str, rejections: &[&str]) -> CandidateExplanation {
+        CandidateExplanation {
+            route_id: RouteId(id.into()),
+            allowed: false,
+            rejections: rejections
+                .iter()
+                .map(|rejection| (*rejection).into())
+                .collect(),
+            terms: None,
+        }
+    }
+
+    fn refresh_selected_digest(decision: &mut RouteDecision) {
+        let RouteDecision::Selected {
+            schema_version,
+            decision_digest,
+            plan,
+        } = decision
+        else {
+            panic!("candidate must be selected");
+        };
+        *decision_digest = selected_digest(*schema_version, plan);
+    }
+
+    fn assert_selected_contract_invalid(mutator: impl FnOnce(&mut RoutePlan)) {
+        let mut decision = decide(vec![candidate("selected")], weights()).unwrap();
+        let RouteDecision::Selected { plan, .. } = &mut decision else {
+            panic!("candidate must be selected");
+        };
+        mutator(plan);
+        refresh_selected_digest(&mut decision);
+        assert_eq!(
+            decision.verify_integrity(),
+            Err(RouteError::DecisionContractInvalid)
+        );
+    }
+
+    #[test]
+    fn maximum_action_score_is_valid_digest_bound_and_exposed() {
+        let mut at_limit = candidate("at-limit");
+        at_limit.metrics = RouteMetricSnapshot {
+            latency: 10_000,
+            cost: 10_000,
+            failure: 10_000,
+            pressure: 10_000,
+            exposure: 10_000,
+            switching: 10_000,
+        };
+        at_limit.semantic_loss = 10_000;
+        let limit_weights = RouteWeights {
+            latency: 10_000,
+            cost: 10_000,
+            failure: 10_000,
+            semantic_loss: 10_000,
+            pressure: 10_000,
+            exposure: 10_000,
+            switching: 10_000,
+        };
+        let decision = decide(vec![at_limit], limit_weights).unwrap();
+        let RouteDecision::Selected {
+            schema_version,
+            decision_digest,
+            plan,
+        } = &decision
+        else {
+            panic!("candidate must be selected");
+        };
+        let terms = plan.explanation.candidates[0].terms.as_ref().unwrap();
+        assert_eq!(terms.total(), Ok(MAX_ACTION_SCORE));
+        assert_eq!(plan.action_score, MAX_ACTION_SCORE);
+        assert_eq!(*decision_digest, selected_digest(*schema_version, plan));
+        assert_ne!(*decision_digest, Sha256Digest::default());
+        assert_eq!(decision.decision_digest(), *decision_digest);
+        assert_eq!(decision.verify_integrity(), Ok(()));
+    }
+
+    #[test]
+    fn selected_metadata_and_ranking_invariants_fail_independently() {
+        assert_selected_contract_invalid(|plan| {
+            plan.explanation.selected = RouteId("different".into());
+        });
+        assert_selected_contract_invalid(|plan| {
+            plan.explanation.tie_breaker = "unstable input order".into();
+        });
+        assert_selected_contract_invalid(|plan| {
+            plan.action_score += 1;
+        });
+        assert_selected_contract_invalid(|plan| {
+            plan.explanation.candidates[0].allowed = false;
+        });
+        assert_selected_contract_invalid(|plan| {
+            plan.explanation.candidates[0].rejections = vec!["not eligible".into()];
+        });
+        assert_selected_contract_invalid(|plan| {
+            plan.explanation.candidates[0].terms = None;
+        });
+
+        let mut non_winner = decide(vec![candidate("b"), candidate("a")], weights()).unwrap();
+        let RouteDecision::Selected { plan, .. } = &mut non_winner else {
+            panic!("candidate must be selected");
+        };
+        plan.selected = RouteId("b".into());
+        plan.explanation.selected = RouteId("b".into());
+        refresh_selected_digest(&mut non_winner);
+        assert_eq!(
+            non_winner.verify_integrity(),
+            Err(RouteError::DecisionContractInvalid)
+        );
+    }
+
+    #[test]
+    fn explanation_contract_covers_order_and_field_permutations() {
+        let allowed_a = allowed_explanation("a");
+        let allowed_b = allowed_explanation("b");
+        assert_eq!(
+            validate_explanations(&[allowed_a.clone(), allowed_b.clone()], false),
+            Ok(())
+        );
+        assert_eq!(
+            validate_explanations(&[allowed_b.clone(), allowed_a.clone()], false),
+            Err(RouteError::DecisionContractInvalid)
+        );
+        assert_eq!(
+            validate_explanations(&[allowed_a.clone(), allowed_a.clone()], false),
+            Err(RouteError::DecisionContractInvalid)
+        );
+        assert_eq!(
+            validate_explanations(&[allowed_a.clone()], true),
+            Err(RouteError::DecisionContractInvalid)
+        );
+
+        let mut allowed_with_rejection = allowed_a.clone();
+        allowed_with_rejection.rejections = vec!["unexpected".into()];
+        assert_eq!(
+            validate_explanations(&[allowed_with_rejection], false),
+            Err(RouteError::DecisionContractInvalid)
+        );
+        let mut allowed_without_terms = allowed_a;
+        allowed_without_terms.terms = None;
+        assert_eq!(
+            validate_explanations(&[allowed_without_terms], false),
+            Err(RouteError::DecisionContractInvalid)
+        );
+
+        let denied_a = denied_explanation("a", &["a reason", "z reason"]);
+        let denied_b = denied_explanation("b", &["reason"]);
+        assert_eq!(
+            validate_explanations(&[denied_a.clone(), denied_b], true),
+            Ok(())
+        );
+        let mut denied_with_terms = denied_a.clone();
+        denied_with_terms.terms = Some(score_terms());
+        assert_eq!(
+            validate_explanations(&[denied_with_terms], true),
+            Err(RouteError::DecisionContractInvalid)
+        );
+        assert_eq!(
+            validate_explanations(&[denied_explanation("empty", &[])], true),
+            Err(RouteError::DecisionContractInvalid)
+        );
+        assert_eq!(
+            validate_explanations(&[denied_explanation("blank", &["   "])], true),
+            Err(RouteError::DecisionContractInvalid)
+        );
+        assert_eq!(
+            validate_explanations(
+                &[denied_explanation("unsorted", &["z reason", "a reason"])],
+                true,
+            ),
+            Err(RouteError::DecisionContractInvalid)
+        );
+        assert_eq!(
+            validate_explanations(
+                &[denied_explanation("duplicate", &["reason", "reason"])],
+                true,
+            ),
+            Err(RouteError::DecisionContractInvalid)
+        );
+        assert_eq!(
+            validate_explanations(&[denied_explanation("", &["reason"])], true),
+            Err(RouteError::DecisionContractInvalid)
+        );
     }
 
     #[test]
