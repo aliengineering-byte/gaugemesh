@@ -171,20 +171,21 @@ jobs:
             fi
             tar -xOzf "$package" "$root/Cargo.toml" > "$RUNNER_TEMP/$root.Cargo.toml"
             grep -Eq '^license[[:space:]]*=[[:space:]]*"Apache-2.0"' "$RUNNER_TEMP/$root.Cargo.toml"
-            python - "$RUNNER_TEMP/$root.Cargo.toml" <<'PY'
-            import sys
-            import tomllib
-
-            value = tomllib.load(open(sys.argv[1], "rb"))
-            scopes = [value]
-            scopes.extend(value.get("target", {}).values())
-            for scope in scopes:
-                for section in ("dependencies", "dev-dependencies", "build-dependencies"):
-                    for name, dependency in scope.get(section, {}).items():
-                        if isinstance(dependency, dict) and "path" in dependency:
-                            raise SystemExit(f"local path retained for dependency {name}")
-            PY
           done
+          python - "$RUNNER_TEMP"/*.Cargo.toml <<'PY'
+          import sys
+          import tomllib
+
+          for path in sys.argv[1:]:
+              value = tomllib.load(open(path, "rb"))
+              scopes = [value]
+              scopes.extend(value.get("target", {}).values())
+              for scope in scopes:
+                  for section in ("dependencies", "dev-dependencies", "build-dependencies"):
+                      for name, dependency in scope.get(section, {}).items():
+                          if isinstance(dependency, dict) and "path" in dependency:
+                              raise SystemExit(f"local path retained for dependency {name}")
+          PY
           grep -Fxq Cargo.toml "$RUNNER_TEMP/crates-output/gaugemesh-0.2.1.files.txt"
           grep -Fxq README.md "$RUNNER_TEMP/crates-output/gaugemesh-0.2.1.files.txt"
           if grep -Eq '(^|/)(\.git|target|\.env|\.venv|__pycache__|node_modules)(/|$)' "$RUNNER_TEMP/crates-output/gaugemesh-0.2.1.files.txt"; then
