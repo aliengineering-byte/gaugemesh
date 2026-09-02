@@ -4,11 +4,16 @@ exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/aliengineering-byte/gaugemesh"
+homepage = "https://github.com/aliengineering-byte/gaugemesh"
+documentation = "https://docs.rs/gaugemesh"
+readme = "README.md"
+keywords = ["agents", "mcp", "routing", "policy", "verification"]
+categories = ["command-line-utilities", "development-tools", "network-programming"]
 
 [workspace.dependencies]
 anyhow = "=1.0.103"

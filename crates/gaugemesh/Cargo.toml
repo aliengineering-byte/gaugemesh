@@ -5,7 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Semantics-preserving routing for agents, MCP servers, and models"
+publish = ["crates-io"]
 
 [[bin]]
 name = "gaugemesh"
@@ -18,7 +24,7 @@ axum.workspace = true
 axum-server.workspace = true
 base64.workspace = true
 clap.workspace = true
-gaugemesh-core = { version = "=0.2.0", path = "../gaugemesh-core" }
+gaugemesh-core = { version = "=0.2.1", path = "../gaugemesh-core" }
 futures-util.workspace = true
 hmac.workspace = true
 hex.workspace = true
