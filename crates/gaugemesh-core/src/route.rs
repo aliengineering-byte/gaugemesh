@@ -4,6 +4,10 @@ use thiserror::Error;
 
 use crate::digest::Sha256Digest;
 
+/// Maximum generated score term: normalized weight 10_000 × normalized metric 10_000.
+pub const MAX_SCORE_TERM: u64 = 100_000_000;
+pub const MAX_ACTION_SCORE: u64 = 7 * MAX_SCORE_TERM;
+
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct RouteId(pub String);
@@ -82,14 +86,23 @@ pub struct ScoreTerms {
 }
 
 impl ScoreTerms {
-    pub fn total(&self) -> u64 {
-        self.latency
-            + self.cost
-            + self.failure
-            + self.semantic_loss
-            + self.pressure
-            + self.exposure
-            + self.switching
+    pub fn total(&self) -> Result<u64, RouteError> {
+        let terms = [
+            self.latency,
+            self.cost,
+            self.failure,
+            self.semantic_loss,
+            self.pressure,
+            self.exposure,
+            self.switching,
+        ];
+        if terms.into_iter().any(|term| term > MAX_SCORE_TERM) {
+            return Err(RouteError::DecisionScoreOutOfRange);
+        }
+        terms
+            .into_iter()
+            .try_fold(0_u64, u64::checked_add)
+            .ok_or(RouteError::DecisionScoreOutOfRange)
     }
 }
 
@@ -174,6 +187,9 @@ impl RouteDecision {
                 if *decision_digest != selected_digest(*schema_version, plan) {
                     return Err(RouteError::DecisionDigestMismatch);
                 }
+                if plan.action_score > MAX_ACTION_SCORE {
+                    return Err(RouteError::DecisionScoreOutOfRange);
+                }
                 if plan.selected != plan.explanation.selected
                     || plan.explanation.tie_breaker != "lexicographically smallest stable route_id"
                 {
@@ -185,23 +201,23 @@ impl RouteDecision {
                     .iter()
                     .find(|candidate| candidate.route_id == plan.selected)
                     .ok_or(RouteError::DecisionContractInvalid)?;
+                let selected_score = selected
+                    .terms
+                    .as_ref()
+                    .ok_or(RouteError::DecisionContractInvalid)?
+                    .total()?;
                 if !selected.allowed
                     || !selected.rejections.is_empty()
-                    || selected.terms.as_ref().map(ScoreTerms::total) != Some(plan.action_score)
+                    || selected_score != plan.action_score
                 {
                     return Err(RouteError::DecisionContractInvalid);
                 }
-                let mut ranked = plan
-                    .explanation
-                    .candidates
-                    .iter()
-                    .filter_map(|candidate| {
-                        candidate
-                            .terms
-                            .as_ref()
-                            .map(|terms| (terms.total(), candidate.route_id.clone()))
-                    })
-                    .collect::<Vec<_>>();
+                let mut ranked = Vec::new();
+                for candidate in &plan.explanation.candidates {
+                    if let Some(terms) = &candidate.terms {
+                        ranked.push((terms.total()?, candidate.route_id.clone()));
+                    }
+                }
                 ranked.sort();
                 if ranked.first() != Some(&(plan.action_score, plan.selected.clone())) {
                     return Err(RouteError::DecisionContractInvalid);
@@ -242,6 +258,8 @@ pub enum RouteError {
     DecisionDigestMismatch,
     #[error("GM_ROUTE_DECISION_CONTRACT_INVALID")]
     DecisionContractInvalid,
+    #[error("GM_ROUTE_DECISION_SCORE_OUT_OF_RANGE")]
+    DecisionScoreOutOfRange,
     #[error("GM_ROUTE_DECISION_SCHEMA_UNSUPPORTED")]
     UnsupportedDecisionSchema,
 }
@@ -348,7 +366,7 @@ pub fn decide(
             exposure: u64::from(weights.exposure) * u64::from(metric.exposure),
             switching: u64::from(weights.switching) * u64::from(metric.switching),
         };
-        eligible.push((terms.total(), candidate.route_id.clone()));
+        eligible.push((terms.total()?, candidate.route_id.clone()));
         explanation.push(CandidateExplanation {
             route_id: candidate.route_id.clone(),
             allowed: true,
@@ -685,7 +703,7 @@ mod tests {
             exposure: 13,
             switching: 17,
         };
-        assert_eq!(terms.total(), 58);
+        assert_eq!(terms.total(), Ok(58));
 
         let candidate = RouteCandidate {
             route_id: RouteId("only".into()),
@@ -724,6 +742,83 @@ mod tests {
             switching: 559,
         };
         assert_eq!(plan.explanation.candidates[0].terms, Some(expected.clone()));
-        assert_eq!(plan.action_score, expected.total());
+        assert_eq!(plan.action_score, expected.total().unwrap());
+    }
+
+    fn external_decision_with_scores(latency: u64, cost: u64) -> RouteDecision {
+        let decision = decide(vec![candidate("external")], weights()).unwrap();
+        let mut value = serde_json::to_value(decision).unwrap();
+        value["plan"]["explanation"]["candidates"][0]["terms"]["latency"] = latency.into();
+        value["plan"]["explanation"]["candidates"][0]["terms"]["cost"] = cost.into();
+        let mut external: RouteDecision = serde_json::from_value(value).unwrap();
+        let RouteDecision::Selected {
+            schema_version,
+            decision_digest,
+            plan,
+        } = &mut external
+        else {
+            panic!("candidate must be selected");
+        };
+        *decision_digest = selected_digest(*schema_version, plan);
+        external
+    }
+
+    #[test]
+    fn external_score_overflow_and_out_of_range_terms_fail_closed() {
+        let overflow = external_decision_with_scores(u64::MAX, 1);
+        assert_eq!(
+            overflow.verify_integrity(),
+            Err(RouteError::DecisionScoreOutOfRange)
+        );
+
+        let out_of_range = external_decision_with_scores(MAX_SCORE_TERM + 1, 0);
+        assert_eq!(
+            out_of_range.verify_integrity(),
+            Err(RouteError::DecisionScoreOutOfRange)
+        );
+
+        let decision = decide(vec![candidate("external")], weights()).unwrap();
+        let mut value = serde_json::to_value(decision).unwrap();
+        value["plan"]["action_score"] = (MAX_ACTION_SCORE + 1).into();
+        let mut out_of_range_score: RouteDecision = serde_json::from_value(value).unwrap();
+        let RouteDecision::Selected {
+            schema_version,
+            decision_digest,
+            plan,
+        } = &mut out_of_range_score
+        else {
+            panic!("candidate must be selected");
+        };
+        *decision_digest = selected_digest(*schema_version, plan);
+        assert_eq!(
+            out_of_range_score.verify_integrity(),
+            Err(RouteError::DecisionScoreOutOfRange)
+        );
+    }
+
+    #[test]
+    fn checked_in_schema_matches_generated_score_bounds() {
+        let schema: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../schemas/gaugemesh-route-decision-v1.schema.json"
+        ))
+        .unwrap();
+        for term in [
+            "latency",
+            "cost",
+            "failure",
+            "semantic_loss",
+            "pressure",
+            "exposure",
+            "switching",
+        ] {
+            assert_eq!(
+                schema["$defs"]["scoreTerms"]["properties"][term]["maximum"],
+                MAX_SCORE_TERM
+            );
+        }
+        assert_eq!(
+            schema["$defs"]["routePlan"]["properties"]["action_score"]["maximum"],
+            MAX_ACTION_SCORE
+        );
     }
 }

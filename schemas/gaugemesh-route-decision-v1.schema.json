@@ -37,13 +37,13 @@
       "additionalProperties": false,
       "required": ["latency", "cost", "failure", "semantic_loss", "pressure", "exposure", "switching"],
       "properties": {
-        "latency": { "type": "integer", "minimum": 0 },
-        "cost": { "type": "integer", "minimum": 0 },
-        "failure": { "type": "integer", "minimum": 0 },
-        "semantic_loss": { "type": "integer", "minimum": 0 },
-        "pressure": { "type": "integer", "minimum": 0 },
-        "exposure": { "type": "integer", "minimum": 0 },
-        "switching": { "type": "integer", "minimum": 0 }
+        "latency": { "type": "integer", "minimum": 0, "maximum": 100000000 },
+        "cost": { "type": "integer", "minimum": 0, "maximum": 100000000 },
+        "failure": { "type": "integer", "minimum": 0, "maximum": 100000000 },
+        "semantic_loss": { "type": "integer", "minimum": 0, "maximum": 100000000 },
+        "pressure": { "type": "integer", "minimum": 0, "maximum": 100000000 },
+        "exposure": { "type": "integer", "minimum": 0, "maximum": 100000000 },
+        "switching": { "type": "integer", "minimum": 0, "maximum": 100000000 }
       }
     },
     "candidateExplanation": {
@@ -103,7 +103,7 @@
       "required": ["selected", "action_score", "explanation", "snapshot_digest", "route_policy_digest", "metric_snapshot_digest"],
       "properties": {
         "selected": { "type": "string", "minLength": 1 },
-        "action_score": { "type": "integer", "minimum": 0 },
+        "action_score": { "type": "integer", "minimum": 0, "maximum": 700000000 },
         "explanation": { "$ref": "#/$defs/routeExplanation" },
         "snapshot_digest": { "$ref": "#/$defs/digest" },
         "route_policy_digest": { "$ref": "#/$defs/digest" },
