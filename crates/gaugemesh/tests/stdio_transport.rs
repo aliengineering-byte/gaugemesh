@@ -35,10 +35,12 @@ fn route_explain_emits_an_explicit_no_eligible_decision() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["status"], "denied");
     assert_eq!(value["schema_version"], 1);
-    assert!(value["decision_digest"]
-        .as_str()
-        .unwrap()
-        .starts_with("sha256:"));
+    assert!(
+        value["decision_digest"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
     assert_eq!(value["denial"]["code"], "GM_ROUTE_NO_ELIGIBLE_CANDIDATE");
     assert!(
         value["denial"]["candidates"]
@@ -61,10 +63,12 @@ fn route_explain_selected_contract_is_explicitly_opt_in() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["status"], "selected");
     assert_eq!(value["schema_version"], 1);
-    assert!(value["decision_digest"]
-        .as_str()
-        .unwrap()
-        .starts_with("sha256:"));
+    assert!(
+        value["decision_digest"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
     assert_eq!(value["plan"]["selected"], "local-a");
 }
 
@@ -111,9 +115,7 @@ fn route_decision_schema_is_checked_in_and_validation_is_offline() {
         .output()
         .unwrap();
     assert!(!refused.status.success());
-    assert!(
-        String::from_utf8_lossy(&refused.stderr).contains("GM_ROUTE_DECISION_DIGEST_MISMATCH")
-    );
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("GM_ROUTE_DECISION_DIGEST_MISMATCH"));
 }
 
 fn client(version: ProtocolVersion) -> ClientInfo {

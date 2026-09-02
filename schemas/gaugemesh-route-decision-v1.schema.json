@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/aliengineering-byte/gaugemesh/blob/main/schemas/gaugemesh-route-decision-v1.schema.json",
+  "$id": "urn:aeb:gaugemesh:schema:route-decision:v1",
   "title": "GaugeMesh route decision v1",
   "description": "Unsigned, recomputable route-decision integrity contract. This schema is not authentication.",
   "oneOf": [

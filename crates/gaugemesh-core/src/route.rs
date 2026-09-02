@@ -175,8 +175,7 @@ impl RouteDecision {
                     return Err(RouteError::DecisionDigestMismatch);
                 }
                 if plan.selected != plan.explanation.selected
-                    || plan.explanation.tie_breaker
-                        != "lexicographically smallest stable route_id"
+                    || plan.explanation.tie_breaker != "lexicographically smallest stable route_id"
                 {
                     return Err(RouteError::DecisionContractInvalid);
                 }
@@ -433,7 +432,10 @@ fn validate_explanations(
                 .rejections
                 .iter()
                 .any(|rejection| rejection.trim().is_empty())
-            || candidate.rejections.windows(2).any(|pair| pair[0] >= pair[1])
+            || candidate
+                .rejections
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
         {
             return Err(RouteError::DecisionContractInvalid);
         }
@@ -559,10 +561,12 @@ mod tests {
         .unwrap();
         assert_eq!(encoded["status"], "denied");
         assert_eq!(encoded["denial"]["code"], "GM_ROUTE_NO_ELIGIBLE_CANDIDATE");
-        assert!(encoded["decision_digest"]
-            .as_str()
-            .unwrap()
-            .starts_with("sha256:"));
+        assert!(
+            encoded["decision_digest"]
+                .as_str()
+                .unwrap()
+                .starts_with("sha256:")
+        );
     }
 
     #[test]
