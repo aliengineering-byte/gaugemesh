@@ -75,6 +75,8 @@ an unsafe fallback:
 gaugemesh route explain
 gaugemesh route explain --decision-contract
 gaugemesh route explain --deny-all
+gaugemesh route schema
+gaugemesh route validate decision.json
 ```
 
 ## Architecture
@@ -224,7 +226,19 @@ shape. Opt into the versioned `selected` wrapper with `--decision-contract`.
 `gaugemesh route explain --deny-all` returns the new contract with
 `status: "denied"`, stable
 `GM_ROUTE_NO_ELIGIBLE_CANDIDATE`, every constraint rejection, and the snapshot
-digests. The analogy boundary is documented in
+digests. Route IDs must be unique, denied candidates must carry nonblank reasons,
+and candidate/reason ordering is canonical. Both selected and denied contracts
+include `decision_digest`, a SHA-256 digest over the canonical unsigned decision
+fields other than the digest itself.
+
+The checked-in [route-decision JSON Schema](schemas/gaugemesh-route-decision-v1.schema.json)
+documents the wire contract. Save a decision and run
+`gaugemesh route validate <file>` to check its schema, digest, and derivable
+selection/denial invariants entirely offline. The digest is unsigned and
+recomputable integrity, not authentication against a party able to rewrite the
+whole decision. Decisions contain route IDs and constraint reasons; validation
+does not upload them, and they should be sanitized before sharing. The analogy
+boundary is documented in
 [the physics model](docs/architecture/PHYSICS_MODEL.md).
 
 ## Safety boundaries

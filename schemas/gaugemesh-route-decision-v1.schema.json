@@ -1,0 +1,134 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/aliengineering-byte/gaugemesh/blob/main/schemas/gaugemesh-route-decision-v1.schema.json",
+  "title": "GaugeMesh route decision v1",
+  "description": "Unsigned, recomputable route-decision integrity contract. This schema is not authentication.",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "schema_version", "decision_digest", "plan"],
+      "properties": {
+        "status": { "const": "selected" },
+        "schema_version": { "const": 1 },
+        "decision_digest": { "$ref": "#/$defs/digest" },
+        "plan": { "$ref": "#/$defs/routePlan" }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "schema_version", "decision_digest", "denial"],
+      "properties": {
+        "status": { "const": "denied" },
+        "schema_version": { "const": 1 },
+        "decision_digest": { "$ref": "#/$defs/digest" },
+        "denial": { "$ref": "#/$defs/routeDenial" }
+      }
+    }
+  ],
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "scoreTerms": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["latency", "cost", "failure", "semantic_loss", "pressure", "exposure", "switching"],
+      "properties": {
+        "latency": { "type": "integer", "minimum": 0 },
+        "cost": { "type": "integer", "minimum": 0 },
+        "failure": { "type": "integer", "minimum": 0 },
+        "semantic_loss": { "type": "integer", "minimum": 0 },
+        "pressure": { "type": "integer", "minimum": 0 },
+        "exposure": { "type": "integer", "minimum": 0 },
+        "switching": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "candidateExplanation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["route_id", "allowed", "rejections", "terms"],
+      "properties": {
+        "route_id": { "type": "string", "minLength": 1 },
+        "allowed": { "type": "boolean" },
+        "rejections": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1, "pattern": ".*\\S.*" }
+        },
+        "terms": {
+          "oneOf": [
+            { "$ref": "#/$defs/scoreTerms" },
+            { "type": "null" }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "allowed": { "const": true } } },
+          "then": {
+            "properties": {
+              "rejections": { "maxItems": 0 },
+              "terms": { "$ref": "#/$defs/scoreTerms" }
+            }
+          },
+          "else": {
+            "properties": {
+              "rejections": { "minItems": 1 },
+              "terms": { "type": "null" }
+            }
+          }
+        }
+      ]
+    },
+    "routeExplanation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidates", "selected", "tie_breaker"],
+      "properties": {
+        "candidates": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/candidateExplanation" }
+        },
+        "selected": { "type": "string", "minLength": 1 },
+        "tie_breaker": { "const": "lexicographically smallest stable route_id" }
+      }
+    },
+    "routePlan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["selected", "action_score", "explanation", "snapshot_digest", "route_policy_digest", "metric_snapshot_digest"],
+      "properties": {
+        "selected": { "type": "string", "minLength": 1 },
+        "action_score": { "type": "integer", "minimum": 0 },
+        "explanation": { "$ref": "#/$defs/routeExplanation" },
+        "snapshot_digest": { "$ref": "#/$defs/digest" },
+        "route_policy_digest": { "$ref": "#/$defs/digest" },
+        "metric_snapshot_digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "routeDenial": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "candidates", "snapshot_digest", "route_policy_digest", "metric_snapshot_digest"],
+      "properties": {
+        "code": { "const": "GM_ROUTE_NO_ELIGIBLE_CANDIDATE" },
+        "candidates": {
+          "type": "array",
+          "items": {
+            "allOf": [
+              { "$ref": "#/$defs/candidateExplanation" },
+              { "properties": { "allowed": { "const": false } } }
+            ]
+          }
+        },
+        "snapshot_digest": { "$ref": "#/$defs/digest" },
+        "route_policy_digest": { "$ref": "#/$defs/digest" },
+        "metric_snapshot_digest": { "$ref": "#/$defs/digest" }
+      }
+    }
+  }
+}

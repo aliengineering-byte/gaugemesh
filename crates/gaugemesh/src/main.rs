@@ -13,7 +13,8 @@ use gaugemesh_core::{
     },
     policy::{PolicyDocument, PolicyEffect},
     route::{
-        ConstraintResult, RouteCandidate, RouteId, RouteMetricSnapshot, RouteWeights, decide, plan,
+        ConstraintResult, RouteCandidate, RouteDecision, RouteId, RouteMetricSnapshot,
+        RouteWeights, decide, plan,
     },
     storage::{LeaseStorage, MemoryStorage, SqliteStorage},
 };
@@ -171,6 +172,10 @@ enum RouteCommand {
         #[arg(long)]
         decision_contract: bool,
     },
+    /// Print the checked-in route-decision JSON Schema.
+    Schema,
+    /// Validate a route-decision artifact locally without network access.
+    Validate { path: PathBuf },
 }
 
 #[derive(Debug, Subcommand)]
@@ -199,13 +204,20 @@ async fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Init { path, force } => initialize(path, force),
         Command::Doctor { config } => doctor(config.as_deref()),
-        Command::Route {
-            command:
-                RouteCommand::Explain {
-                    deny_all,
-                    decision_contract,
-                },
-        } => explain_route(deny_all, decision_contract),
+        Command::Route { command } => match command {
+            RouteCommand::Explain {
+                deny_all,
+                decision_contract,
+            } => explain_route(deny_all, decision_contract),
+            RouteCommand::Schema => {
+                print!(
+                    "{}",
+                    include_str!("../../../schemas/gaugemesh-route-decision-v1.schema.json")
+                );
+                Ok(())
+            }
+            RouteCommand::Validate { path } => validate_route_decision(&path),
+        },
         Command::Schema => {
             println!(
                 "{}",
@@ -917,6 +929,31 @@ fn explain_route(deny_all: bool, decision_contract: bool) -> Result<()> {
         let plan = plan(candidates, default_weights())?;
         println!("{}", serde_json::to_string_pretty(&plan)?);
     }
+    Ok(())
+}
+
+fn validate_route_decision(path: &Path) -> Result<()> {
+    const MAX_DECISION_BYTES: u64 = 1024 * 1024;
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("GM_ROUTE_DECISION_READ:{}", path.display()))?;
+    if metadata.len() > MAX_DECISION_BYTES {
+        bail!("GM_ROUTE_DECISION_TOO_LARGE");
+    }
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("GM_ROUTE_DECISION_READ:{}", path.display()))?;
+    let decision: RouteDecision =
+        serde_json::from_str(&contents).context("GM_ROUTE_DECISION_SCHEMA_INVALID")?;
+    decision.verify_integrity()?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "evidence": "VERIFIED",
+            "schema_version": 1,
+            "decision_digest": decision.decision_digest(),
+            "integrity": "unsigned-recomputable",
+            "authentication": "none"
+        }))?
+    );
     Ok(())
 }
 

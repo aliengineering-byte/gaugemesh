@@ -1,4 +1,4 @@
-use std::process::Command;
+use std::{fs, process::Command};
 
 use rmcp::{
     ClientLifecycleMode, ClientServiceExt, ServiceExt,
@@ -35,6 +35,10 @@ fn route_explain_emits_an_explicit_no_eligible_decision() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["status"], "denied");
     assert_eq!(value["schema_version"], 1);
+    assert!(value["decision_digest"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
     assert_eq!(value["denial"]["code"], "GM_ROUTE_NO_ELIGIBLE_CANDIDATE");
     assert!(
         value["denial"]["candidates"]
@@ -57,7 +61,59 @@ fn route_explain_selected_contract_is_explicitly_opt_in() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["status"], "selected");
     assert_eq!(value["schema_version"], 1);
+    assert!(value["decision_digest"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
     assert_eq!(value["plan"]["selected"], "local-a");
+}
+
+#[test]
+fn route_decision_schema_is_checked_in_and_validation_is_offline() {
+    let schema = Command::new(env!("CARGO_BIN_EXE_gaugemesh"))
+        .args(["route", "schema"])
+        .output()
+        .unwrap();
+    assert!(schema.status.success());
+    let schema_value: serde_json::Value = serde_json::from_slice(&schema.stdout).unwrap();
+    assert_eq!(
+        schema_value["$schema"],
+        "https://json-schema.org/draft/2020-12/schema"
+    );
+
+    let decision = Command::new(env!("CARGO_BIN_EXE_gaugemesh"))
+        .args(["route", "explain", "--deny-all"])
+        .output()
+        .unwrap();
+    assert!(decision.status.success());
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("decision.json");
+    fs::write(&path, &decision.stdout).unwrap();
+    let verified = Command::new(env!("CARGO_BIN_EXE_gaugemesh"))
+        .arg("route")
+        .arg("validate")
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(verified.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&verified.stdout).unwrap();
+    assert_eq!(value["evidence"], "VERIFIED");
+    assert_eq!(value["integrity"], "unsigned-recomputable");
+    assert_eq!(value["authentication"], "none");
+
+    let mut tampered: serde_json::Value = serde_json::from_slice(&decision.stdout).unwrap();
+    tampered["denial"]["candidates"][0]["rejections"][0] = "tampered".into();
+    fs::write(&path, serde_json::to_vec_pretty(&tampered).unwrap()).unwrap();
+    let refused = Command::new(env!("CARGO_BIN_EXE_gaugemesh"))
+        .arg("route")
+        .arg("validate")
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("GM_ROUTE_DECISION_DIGEST_MISMATCH")
+    );
 }
 
 fn client(version: ProtocolVersion) -> ClientInfo {

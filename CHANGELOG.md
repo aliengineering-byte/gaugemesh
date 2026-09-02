@@ -8,6 +8,13 @@ All notable changes are documented here.
   digest-bound denial contract that reports every hard-constraint rejection
   when no route is eligible. The default `route explain` JSON remains the
   original `0.1.0` bare-plan shape for existing machine consumers.
+- Reject duplicate route IDs and unexplained denials, canonicalize denial
+  ordering, and bind the complete selected/denied payload with an unsigned,
+  recomputable decision digest.
+- Add a checked-in decision JSON Schema and offline `route validate` command.
+- Bump the unreleased workspace/package identity to `0.2.0` and update package
+  acceptance artifacts accordingly.
+- Upgrade all workflow checkout pins from immutable v4 to immutable v6 commits.
 
 ## 0.1.0 - 2026-08-30
 
