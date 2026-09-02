@@ -171,10 +171,19 @@ jobs:
             fi
             tar -xOzf "$package" "$root/Cargo.toml" > "$RUNNER_TEMP/$root.Cargo.toml"
             grep -Eq '^license[[:space:]]*=[[:space:]]*"Apache-2.0"' "$RUNNER_TEMP/$root.Cargo.toml"
-            if grep -Eq '^[[:space:]]*path[[:space:]]*=' "$RUNNER_TEMP/$root.Cargo.toml"; then
-              echo "Normalized package manifest retained a local path dependency" >&2
-              exit 1
-            fi
+            python - "$RUNNER_TEMP/$root.Cargo.toml" <<'PY'
+            import sys
+            import tomllib
+
+            value = tomllib.load(open(sys.argv[1], "rb"))
+            scopes = [value]
+            scopes.extend(value.get("target", {}).values())
+            for scope in scopes:
+                for section in ("dependencies", "dev-dependencies", "build-dependencies"):
+                    for name, dependency in scope.get(section, {}).items():
+                        if isinstance(dependency, dict) and "path" in dependency:
+                            raise SystemExit(f"local path retained for dependency {name}")
+            PY
           done
           grep -Fxq Cargo.toml "$RUNNER_TEMP/crates-output/gaugemesh-0.2.1.files.txt"
           grep -Fxq README.md "$RUNNER_TEMP/crates-output/gaugemesh-0.2.1.files.txt"
@@ -184,7 +193,7 @@ jobs:
           fi
           source_bytes=$(find crates/gaugemesh -type f -printf '%s\n' | awk '{total += $1} END {print total + 0}')
           test "$source_bytes" -le 10000000
-          (cd "$RUNNER_TEMP/crates-output" && sha256sum *.crate > SHA256SUMS)
+          (cd "$RUNNER_TEMP/crates-output" && sha256sum -- ./*.crate > SHA256SUMS)
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: crates-io-0.2.1-core-candidate
