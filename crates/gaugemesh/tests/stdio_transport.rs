@@ -35,17 +35,16 @@ fn route_explain_emits_an_explicit_no_eligible_decision() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["status"], "denied");
     assert_eq!(value["schema_version"], 1);
-    assert_eq!(
-        value["denial"]["code"],
-        "GM_ROUTE_NO_ELIGIBLE_CANDIDATE"
+    assert_eq!(value["denial"]["code"], "GM_ROUTE_NO_ELIGIBLE_CANDIDATE");
+    assert!(
+        value["denial"]["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|candidate| candidate["allowed"] == false
+                && candidate["terms"].is_null()
+                && !candidate["rejections"].as_array().unwrap().is_empty())
     );
-    assert!(value["denial"]["candidates"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|candidate| candidate["allowed"] == false
-            && candidate["terms"].is_null()
-            && !candidate["rejections"].as_array().unwrap().is_empty()));
 }
 
 #[test]

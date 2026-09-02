@@ -140,7 +140,10 @@ pub struct RouteDenial {
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum RouteDecision {
-    Selected { schema_version: u16, plan: RoutePlan },
+    Selected {
+        schema_version: u16,
+        plan: RoutePlan,
+    },
     Denied {
         schema_version: u16,
         denial: RouteDenial,
@@ -382,10 +385,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(encoded["status"], "denied");
-        assert_eq!(
-            encoded["denial"]["code"],
-            "GM_ROUTE_NO_ELIGIBLE_CANDIDATE"
-        );
+        assert_eq!(encoded["denial"]["code"], "GM_ROUTE_NO_ELIGIBLE_CANDIDATE");
     }
 
     #[test]
