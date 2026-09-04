@@ -48,6 +48,8 @@ jobs:
           toolchain: 1.88.0
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - run: cargo build --locked
+      - name: Prime exact ResiliReplay CLI outside the bounded verifier
+        run: npx -y resilireplay@0.7.0 --version
       - run: '"$CARGO_TARGET_DIR/debug/gaugemesh" verify --resilireplay'
 
   fuzz-smoke:
