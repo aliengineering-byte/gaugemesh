@@ -168,7 +168,10 @@ async fn run_resilireplay(directory: &Path, common: &[String], tail: &[String]) 
         .args(tail)
         .current_dir(directory)
         .kill_on_drop(true);
-    tokio::time::timeout(Duration::from_secs(60), command.output())
+    // A clean runner may need to acquire the exact npm release before the
+    // bounded campaign starts; keep that acquisition bounded without making
+    // the verification depend on a warm npx cache.
+    tokio::time::timeout(Duration::from_secs(180), command.output())
         .await
         .context("GM_VERIFY_PROCESS_TIMEOUT")?
         .context("GM_VERIFY_PROCESS_START")
