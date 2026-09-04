@@ -9,6 +9,11 @@ on:
         description: Existing protected annotated release tag
         required: true
         type: string
+      reverify_only:
+        description: Reverify existing immutable release artifacts without rebuilding or uploading
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -22,6 +27,7 @@ jobs:
       source_sha: ${{ steps.release.outputs.source_sha }}
       tag: ${{ steps.release.outputs.tag }}
       version: ${{ steps.release.outputs.version }}
+      image_digest: ${{ steps.release.outputs.image_digest }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -49,15 +55,30 @@ jobs:
           git merge-base --is-ancestor "$source_sha" origin/main
           python scripts/verify_repository_rules.py --repository "$GITHUB_REPOSITORY"
           created="$(git show -s --format=%cI "$source_sha")"
+          image_digest=''
+          if test '${{ inputs.reverify_only }}' = 'true'; then
+            server="$RUNNER_TEMP/gaugemesh-${RELEASE_TAG}-server.json"
+            curl --fail --location --retry 8 --retry-all-errors \
+              "https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/gaugemesh-${RELEASE_TAG}-server.json" \
+              --output "$server"
+            identifier="$(jq -er '.packages[0].identifier' "$server")"
+            expected_prefix="ghcr.io/${GITHUB_REPOSITORY}@"
+            test "${identifier#"$expected_prefix"}" != "$identifier"
+            image_digest="${identifier#"$expected_prefix"}"
+            [[ "$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            test "$(jq -r '.version' "$server")" = "$version"
+          fi
           {
             echo "created=$created"
             echo "source_sha=$source_sha"
             echo "tag=$RELEASE_TAG"
             echo "version=$version"
+            echo "image_digest=$image_digest"
           } >> "$GITHUB_OUTPUT"
 
   binaries:
     needs: validate
+    if: ${{ !inputs.reverify_only }}
     name: binary (${{ matrix.target }})
     strategy:
       fail-fast: false
@@ -119,6 +140,7 @@ jobs:
 
   image-build:
     needs: validate
+    if: ${{ !inputs.reverify_only }}
     name: image (${{ matrix.platform }})
     strategy:
       fail-fast: false
@@ -172,6 +194,7 @@ jobs:
 
   image:
     needs: [validate, image-build]
+    if: ${{ !inputs.reverify_only }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     outputs:
@@ -240,6 +263,7 @@ jobs:
 
   publish:
     needs: [validate, binaries, image]
+    if: ${{ !inputs.reverify_only }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -292,10 +316,16 @@ jobs:
 
   public-install:
     needs: [validate, publish, image]
+    if: >-
+      ${{ always() &&
+          needs.validate.result == 'success' &&
+          (inputs.reverify_only ||
+           (needs.publish.result == 'success' && needs.image.result == 'success')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
       RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+      IMAGE_DIGEST: ${{ needs.image.outputs.digest || needs.validate.outputs.image_digest }}
     permissions:
       contents: read
       attestations: read
@@ -325,7 +355,7 @@ jobs:
           gh attestation verify "gaugemesh-${RELEASE_TAG}-server.json" --repo "$GITHUB_REPOSITORY"
           gh attestation verify SHA256SUMS --repo "$GITHUB_REPOSITORY"
           grep -E 'x86_64-unknown-linux-gnu|spdx|server.json' SHA256SUMS | sha256sum --check
-          jq -e --arg digest "${{ needs.image.outputs.digest }}" --arg version "${RELEASE_TAG#v}" \
+          jq -e --arg digest "$IMAGE_DIGEST" --arg version "${RELEASE_TAG#v}" \
             '.name == "io.github.aliengineering-byte/gaugemesh" and
              .version == $version and
              .packages[0].registryType == "oci" and
@@ -344,22 +374,27 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          image="ghcr.io/${GITHUB_REPOSITORY}@${{ needs.image.outputs.digest }}"
+          image="ghcr.io/${GITHUB_REPOSITORY}@$IMAGE_DIGEST"
           docker pull --platform linux/amd64 "$image"
           test "$(docker image inspect --format '{{ index .Config.Labels "io.modelcontextprotocol.server.name" }}' "$image")" = \
             'io.github.aliengineering-byte/gaugemesh'
           docker run --rm --platform linux/amd64 "$image" --version
-          docker image rm "$image"
-          docker pull --platform linux/arm64 "$image"
-          docker run --rm --platform linux/arm64 "$image" --version
       - name: Exercise the public image's stdio MCP lifecycle
         shell: bash
-        env:
-          IMAGE: ghcr.io/${{ github.repository }}@${{ needs.image.outputs.digest }}
         run: |
           set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY}@$IMAGE_DIGEST"
+          # Keep image transfer outside the protocol client's bounded response timer.
+          docker pull --platform linux/amd64 "$image"
           python "$RUNNER_TEMP/public-gaugemesh/scripts/mcp_stdio_smoke.py" \
-            -- docker run --rm -i --platform linux/amd64 "$IMAGE" mcp-stdio
+            -- docker run --rm -i --platform linux/amd64 "$image" mcp-stdio
+      - name: Execute the public arm64 image
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY}@$IMAGE_DIGEST"
+          docker pull --platform linux/arm64 "$image"
+          docker run --rm --platform linux/arm64 "$image" --version
       - name: Re-run public OpenAI SDK and MCP client paths
         shell: bash
         run: |
@@ -437,6 +472,11 @@ jobs:
 
   publish-mcp-registry:
     needs: [validate, public-install, image]
+    if: >-
+      ${{ always() &&
+          needs.validate.result == 'success' &&
+          needs.public-install.result == 'success' &&
+          (inputs.reverify_only || needs.image.result == 'success') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -458,7 +498,7 @@ jobs:
       - name: Validate and publish immutable OCI metadata
         shell: bash
         env:
-          IMAGE_DIGEST: ${{ needs.image.outputs.digest }}
+          IMAGE_DIGEST: ${{ needs.image.outputs.digest || needs.validate.outputs.image_digest }}
           MCP_REGISTRY: https://registry.modelcontextprotocol.io
         run: |
           set -euo pipefail
