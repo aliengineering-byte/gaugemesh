@@ -11,6 +11,12 @@ deterministic, and explainable. The base deployment is one binary with memory or
 SQLite; it needs no hosted control plane, Redis, PostgreSQL, Docker, or
 Kubernetes.
 
+Install without Rust from the checksummed, attested
+[GitHub Release](https://github.com/aliengineering-byte/gaugemesh/releases) or
+run the multi-architecture GHCR image. Crates.io is not a GaugeMesh distribution
+channel. The real stdio MCP server is `gaugemesh mcp-stdio`; its Official MCP
+Registry metadata is checked in as [`server.json`](server.json).
+
 ## Run the local proof
 
 From a release archive:

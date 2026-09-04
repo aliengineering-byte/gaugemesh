@@ -4,6 +4,12 @@ All notable changes are documented here.
 
 ## Unreleased
 
+## 0.2.2 - 2026-09-03
+
+- Make GitHub Releases and the multi-architecture GHCR image the supported no-crates distribution paths; crate publication is disabled.
+- Label the GHCR image with its Official MCP Registry identity and publish schema-current, digest-pinned OCI metadata only after public-image validation.
+- Add public registry-query and stdio-launch gates without changing or replacing existing release tags or assets.
+
 ## 0.2.1 - 2026-09-02
 
 - Correct the public selected/denied decision examples to use shell redirection

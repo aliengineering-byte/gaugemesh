@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 env:
-  PACKAGE_VERSION: 0.2.1
+  PACKAGE_VERSION: 0.2.2
 
 jobs:
   archive:
@@ -97,113 +97,44 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  crates-io-packages:
+  no-crates-distribution-policy:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-      - name: Keep crate build output outside the checkout
-        shell: bash
-        run: echo "CARGO_TARGET_DIR=$RUNNER_TEMP/gaugemesh-crates-target" >> "$GITHUB_ENV"
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
-        with:
-          toolchain: 1.88.0
-      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
-      - name: Validate registry metadata and the publication dependency order
+      - name: Enforce GitHub Release, GHCR, and MCP Registry distribution only
         shell: bash
         run: |
           set -euo pipefail
-          cargo metadata --locked --no-deps --format-version 1 > "$RUNNER_TEMP/metadata.json"
-          python - "$RUNNER_TEMP/metadata.json" <<'PY'
+          python - <<'PY'
           import json
           import pathlib
-          import sys
-
-          value = json.load(open(sys.argv[1], encoding="utf-8"))
-          packages = {package["name"]: package for package in value["packages"]}
-          assert set(packages) == {"gaugemesh", "gaugemesh-core"}
-          for name, package in packages.items():
-              assert package["version"] == "0.2.1"
-              assert package["license"] == "Apache-2.0"
-              assert package["repository"] == "https://github.com/aliengineering-byte/gaugemesh"
-              assert package["homepage"] == "https://github.com/aliengineering-byte/gaugemesh"
-              assert package["documentation"] == f"https://docs.rs/{name}"
-              assert package["rust_version"] == "1.88"
-              assert package["readme"] and pathlib.Path(package["readme"]).name == "README.md"
-              assert 1 <= len(package["keywords"]) <= 5
-              assert package["categories"] == [
-                  "command-line-utilities", "development-tools", "network-programming"
-              ]
-          dependency = next(
-              dependency for dependency in packages["gaugemesh"]["dependencies"]
-              if dependency["name"] == "gaugemesh-core"
-          )
-          assert dependency["req"] == "=0.2.1"
-          assert dependency["source"] is None
-          PY
-      - name: Run crate formatting and the first-publish core dry run
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo fmt --all --check
-          cargo publish --dry-run --locked -p gaugemesh-core
-          # Cargo correctly refuses a gaugemesh publish dry run until its exact
-          # gaugemesh-core dependency exists on crates.io. Inspect that candidate
-          # below; the owner repeats its full dry run after publishing the core.
-      - name: Inspect the exact core crate and dependent crate file set
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir "$RUNNER_TEMP/crates-output"
-          cargo package --locked -p gaugemesh-core
-          cargo package --locked --list -p gaugemesh-core | tee "$RUNNER_TEMP/crates-output/gaugemesh-core-0.2.1.files.txt"
-          cargo package --locked --list -p gaugemesh | tee "$RUNNER_TEMP/crates-output/gaugemesh-0.2.1.files.txt"
-          cp "$CARGO_TARGET_DIR/package/gaugemesh-core-0.2.1.crate" "$RUNNER_TEMP/crates-output/"
-          for package in "$RUNNER_TEMP/crates-output"/*.crate; do
-            test "$(stat --format=%s "$package")" -le 10000000
-            root="$(basename "$package" .crate)"
-            tar -tzf "$package" > "$RUNNER_TEMP/$root.contents"
-            grep -Fxq "$root/Cargo.toml" "$RUNNER_TEMP/$root.contents"
-            grep -Fxq "$root/README.md" "$RUNNER_TEMP/$root.contents"
-            if grep -Eq '(^|/)(\.git|target|\.env|\.venv|__pycache__|node_modules)(/|$)' "$RUNNER_TEMP/$root.contents"; then
-              echo "Private or generated path entered $package" >&2
-              exit 1
-            fi
-            tar -xOzf "$package" "$root/Cargo.toml" > "$RUNNER_TEMP/$root.Cargo.toml"
-            grep -Eq '^license[[:space:]]*=[[:space:]]*"Apache-2.0"' "$RUNNER_TEMP/$root.Cargo.toml"
-          done
-          python - "$RUNNER_TEMP"/*.Cargo.toml <<'PY'
-          import sys
           import tomllib
 
-          for path in sys.argv[1:]:
-              value = tomllib.load(open(path, "rb"))
-              scopes = [value]
-              scopes.extend(value.get("target", {}).values())
-              for scope in scopes:
-                  for section in ("dependencies", "dev-dependencies", "build-dependencies"):
-                      for name, dependency in scope.get(section, {}).items():
-                          if isinstance(dependency, dict) and "path" in dependency:
-                              raise SystemExit(f"local path retained for dependency {name}")
+          root = pathlib.Path('.')
+          for manifest in ('crates/gaugemesh/Cargo.toml', 'crates/gaugemesh-core/Cargo.toml'):
+              value = tomllib.loads((root / manifest).read_text(encoding='utf-8'))
+              assert value['package']['publish'] is False, f'{manifest} must remain publish=false'
+          server = json.loads((root / 'server.json').read_text(encoding='utf-8'))
+          assert server['version'] == '0.2.2'
+          assert server['packages'][0]['registryType'] == 'oci'
+          assert server['packages'][0]['identifier'] == 'ghcr.io/aliengineering-byte/gaugemesh:0.2.2'
+          assert server['packages'][0]['transport']['type'] == 'stdio'
+          assert server['packages'][0]['packageArguments'][0]['value'] == 'mcp-stdio'
           PY
-          grep -Fxq Cargo.toml "$RUNNER_TEMP/crates-output/gaugemesh-0.2.1.files.txt"
-          grep -Fxq README.md "$RUNNER_TEMP/crates-output/gaugemesh-0.2.1.files.txt"
-          if grep -Eq '(^|/)(\.git|target|\.env|\.venv|__pycache__|node_modules)(/|$)' "$RUNNER_TEMP/crates-output/gaugemesh-0.2.1.files.txt"; then
-            echo "Private or generated path entered the gaugemesh package list" >&2
-            exit 1
-          fi
-          source_bytes=$(find crates/gaugemesh -type f -printf '%s\n' | awk '{total += $1} END {print total + 0}')
-          test "$source_bytes" -le 10000000
-          (cd "$RUNNER_TEMP/crates-output" && sha256sum -- ./*.crate > SHA256SUMS)
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: crates-io-0.2.1-core-candidate
-          path: |
-            ${{ runner.temp }}/crates-output/*.crate
-            ${{ runner.temp }}/crates-output/*.txt
-            ${{ runner.temp }}/crates-output/SHA256SUMS
-          if-no-files-found: error
-          retention-days: 14
+          python - <<'PY'
+          from pathlib import Path
+
+          needles = ("cargo " + "login", "cargo " + "publish", "CARGO_" + "REGISTRY_TOKEN", "crates.io " + "token")
+          offenders = []
+          for path in Path('.github').rglob('*'):
+              if path.is_file():
+                  text = path.read_text(encoding='utf-8')
+                  if any(needle in text for needle in needles):
+                      offenders.append(str(path))
+          if offenders:
+              raise SystemExit(f"A crates.io publication path entered GitHub Actions: {offenders}")
+          PY
 
   openai-sdk:
     needs: archive
