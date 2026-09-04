@@ -11,7 +11,7 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "Invariant and deterministic routing core for GaugeMesh"
-publish = ["crates-io"]
+publish = false
 
 [dependencies]
 argon2.workspace = true

@@ -1,0 +1,33 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.aliengineering-byte/gaugemesh",
+  "title": "GaugeMesh",
+  "description": "Route MCP capabilities through deterministic identity, policy, budget, and deadline constraints.",
+  "websiteUrl": "https://aliengineering-byte.github.io/gaugemesh/",
+  "repository": {
+    "url": "https://github.com/aliengineering-byte/gaugemesh",
+    "source": "github"
+  },
+  "version": "0.2.2",
+  "packages": [
+    {
+      "registryType": "oci",
+      "identifier": "ghcr.io/aliengineering-byte/gaugemesh:0.2.2",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "mcp-stdio"
+        }
+      ]
+    }
+  ],
+  "_meta": {
+    "io.modelcontextprotocol.registry/publisher-provided": {
+      "distribution": "GHCR multi-architecture image; release publication replaces the tag with the immutable manifest digest",
+      "rustRequired": false
+    }
+  }
+}

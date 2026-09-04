@@ -9,6 +9,7 @@ LABEL org.opencontainers.image.description="Semantics-preserving routing for age
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 LABEL org.opencontainers.image.source="https://github.com/aliengineering-byte/gaugemesh"
 LABEL org.opencontainers.image.title="GaugeMesh"
+LABEL io.modelcontextprotocol.server.name="io.github.aliengineering-byte/gaugemesh"
 COPY --from=build /src/target/release/gaugemesh /usr/local/bin/gaugemesh
 USER nonroot:nonroot
 EXPOSE 8090 8092

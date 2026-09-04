@@ -159,6 +159,7 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.title=GaugeMesh
             org.opencontainers.image.version=${{ needs.validate.outputs.version }}
+            io.modelcontextprotocol.server.name=io.github.aliengineering-byte/gaugemesh
           provenance: mode=max
           sbom: true
           cache-from: type=gha,scope=release-image-${{ matrix.suffix }}
@@ -173,6 +174,8 @@ jobs:
     needs: [validate, image-build]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    outputs:
+      digest: ${{ steps.manifest.outputs.digest }}
     permissions:
       contents: read
       packages: write
@@ -258,6 +261,16 @@ jobs:
           format: spdx-json
           output-file: dist/gaugemesh-${{ needs.validate.outputs.tag }}.spdx.json
           upload-artifact: false
+      - name: Bind MCP Registry metadata to the immutable public image
+        shell: bash
+        env:
+          IMAGE_DIGEST: ${{ needs.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          jq --arg identifier "ghcr.io/${GITHUB_REPOSITORY}@$IMAGE_DIGEST" \
+            '.packages[0].identifier = $identifier' \
+            server.json > "dist/gaugemesh-${{ needs.validate.outputs.tag }}-server.json"
       - run: python scripts/checksums.py
       - name: Verify generated checksums
         working-directory: dist
@@ -301,6 +314,7 @@ jobs:
           for file in \
             "gaugemesh-${RELEASE_TAG}-x86_64-unknown-linux-gnu.zip" \
             "gaugemesh-${RELEASE_TAG}.spdx.json" \
+            "gaugemesh-${RELEASE_TAG}-server.json" \
             SHA256SUMS; do
             curl --fail --location --retry 8 --retry-all-errors \
               "$base/$file" --output "$RUNNER_TEMP/public-release/$file"
@@ -308,8 +322,17 @@ jobs:
           cd "$RUNNER_TEMP/public-release"
           gh attestation verify "gaugemesh-${RELEASE_TAG}-x86_64-unknown-linux-gnu.zip" --repo "$GITHUB_REPOSITORY"
           gh attestation verify "gaugemesh-${RELEASE_TAG}.spdx.json" --repo "$GITHUB_REPOSITORY"
+          gh attestation verify "gaugemesh-${RELEASE_TAG}-server.json" --repo "$GITHUB_REPOSITORY"
           gh attestation verify SHA256SUMS --repo "$GITHUB_REPOSITORY"
-          grep -E 'x86_64-unknown-linux-gnu|spdx' SHA256SUMS | sha256sum --check
+          grep -E 'x86_64-unknown-linux-gnu|spdx|server.json' SHA256SUMS | sha256sum --check
+          jq -e --arg digest "${{ needs.image.outputs.digest }}" --arg version "${RELEASE_TAG#v}" \
+            '.name == "io.github.aliengineering-byte/gaugemesh" and
+             .version == $version and
+             .packages[0].registryType == "oci" and
+             .packages[0].transport.type == "stdio" and
+             .packages[0].packageArguments[0].value == "mcp-stdio" and
+             .packages[0].identifier == ("ghcr.io/aliengineering-byte/gaugemesh@" + $digest)' \
+            "gaugemesh-${RELEASE_TAG}-server.json"
           python "$RUNNER_TEMP/public-gaugemesh/scripts/package_smoke.py" \
             --archive "gaugemesh-${RELEASE_TAG}-x86_64-unknown-linux-gnu.zip" \
             --target x86_64-unknown-linux-gnu \
@@ -321,12 +344,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          image="ghcr.io/${GITHUB_REPOSITORY}:${RELEASE_TAG}"
+          image="ghcr.io/${GITHUB_REPOSITORY}@${{ needs.image.outputs.digest }}"
           docker pull --platform linux/amd64 "$image"
+          test "$(docker image inspect --format '{{ index .Config.Labels "io.modelcontextprotocol.server.name" }}' "$image")" = \
+            'io.github.aliengineering-byte/gaugemesh'
           docker run --rm --platform linux/amd64 "$image" --version
           docker image rm "$image"
           docker pull --platform linux/arm64 "$image"
           docker run --rm --platform linux/arm64 "$image" --version
+      - name: Exercise the public image's stdio MCP lifecycle
+        shell: bash
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}@${{ needs.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          python "$RUNNER_TEMP/public-gaugemesh/scripts/mcp_stdio_smoke.py" \
+            -- docker run --rm -i --platform linux/amd64 "$IMAGE" mcp-stdio
       - name: Re-run public OpenAI SDK and MCP client paths
         shell: bash
         run: |
@@ -401,3 +434,50 @@ jobs:
             ${{ runner.temp }}/public-conformance-*
           if-no-files-found: warn
           retention-days: 30
+
+  publish-mcp-registry:
+    needs: [validate, public-install, image]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.validate.outputs.source_sha }}
+      - name: Install checksum-pinned official MCP publisher
+        shell: bash
+        run: |
+          set -euo pipefail
+          url='https://github.com/modelcontextprotocol/registry/releases/download/v1.8.1/mcp-publisher_linux_amd64.tar.gz'
+          curl --fail --location --retry 5 "$url" --output "$RUNNER_TEMP/mcp-publisher.tgz"
+          echo 'a06c9096dcb9727c13555b6be26c7effa707b01f06a4c561ba7a3635443cf2cc  '"$RUNNER_TEMP/mcp-publisher.tgz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/mcp-publisher.tgz" -C "$RUNNER_TEMP" mcp-publisher
+          chmod +x "$RUNNER_TEMP/mcp-publisher"
+      - name: Validate and publish immutable OCI metadata
+        shell: bash
+        env:
+          IMAGE_DIGEST: ${{ needs.image.outputs.digest }}
+          MCP_REGISTRY: https://registry.modelcontextprotocol.io
+        run: |
+          set -euo pipefail
+          jq --arg identifier "ghcr.io/${GITHUB_REPOSITORY}@$IMAGE_DIGEST" \
+            '.packages[0].identifier = $identifier' server.json > "$RUNNER_TEMP/server.json"
+          cd "$RUNNER_TEMP"
+          ./mcp-publisher validate
+          query="$MCP_REGISTRY/v0.1/servers?search=io.github.aliengineering-byte%2Fgaugemesh&version=${{ needs.validate.outputs.version }}"
+          if ! curl --fail --silent --show-error "$query" | jq -e --arg image "ghcr.io/${GITHUB_REPOSITORY}@$IMAGE_DIGEST" \
+            '.servers[]? | select(.server.name == "io.github.aliengineering-byte/gaugemesh" and .server.version == "${{ needs.validate.outputs.version }}" and .server.packages[0].identifier == $image)' >/dev/null; then
+            ./mcp-publisher login github-oidc
+            ./mcp-publisher publish
+          fi
+          for delay in 2 4 8 16 30; do
+            if curl --fail --silent --show-error "$query" | jq -e --arg image "ghcr.io/${GITHUB_REPOSITORY}@$IMAGE_DIGEST" \
+              '.servers[]? | select(.server.name == "io.github.aliengineering-byte/gaugemesh" and .server.version == "${{ needs.validate.outputs.version }}" and .server.packages[0].identifier == $image and .server.packages[0].transport.type == "stdio" and .server.packages[0].packageArguments[0].value == "mcp-stdio")' >/dev/null; then
+              exit 0
+            fi
+            sleep "$delay"
+          done
+          echo 'Exact GaugeMesh Registry metadata did not become public' >&2
+          exit 1
