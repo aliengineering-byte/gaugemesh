@@ -388,6 +388,7 @@ jobs:
           docker pull --platform linux/amd64 "$image"
           python "$RUNNER_TEMP/public-gaugemesh/scripts/mcp_stdio_smoke.py" \
             -- docker run --rm -i --platform linux/amd64 "$image" mcp-stdio
+          docker image rm "$image"
       - name: Execute the public arm64 image
         shell: bash
         run: |
