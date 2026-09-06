@@ -4,6 +4,8 @@ All notable changes are documented here.
 
 ## Unreleased
 
+## 0.3.0 - 2026-09-06
+
 - Add a bounded, SQLite-backed MCP 2026-07-28 Tasks route with caller-scoped
   idempotency, persisted dispatch ownership, public task IDs, conservative
   reconciliation, explicit effect authority, and neutral process qualification.
