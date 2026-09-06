@@ -390,12 +390,10 @@ fn demo(keep: bool, output: Option<PathBuf>, json_output: bool) -> Result<()> {
         && tools[0].identity != tools[1].identity;
     let principal = PrincipalId("local-demo".into());
     let tenant = TenantId("local".into());
-    let now_unix_ms = u64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_millis(),
-    )
-    .context("GM_CLOCK_INVALID")?;
+    // The demo is a deterministic fixture, so its clock must be part of the
+    // fixture rather than ambient wall time. Production lease checks use the
+    // actual Unix clock at their call sites.
+    let now_unix_ms: u64 = 1_893_456_000_000;
     let lease = CapabilityLease::issue(
         principal.clone(),
         tenant.clone(),

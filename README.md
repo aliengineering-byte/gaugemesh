@@ -52,7 +52,7 @@ GaugeMesh demo
 
 Route: local-model -> docs-a__search
 Decision: sha256:169a6315aa69eb7fa3e3b5aae70ede14d4c9ec71c0281d217fd84201414567f1
-Evidence: sha256:beff1b394239b0993d0082e86f4acceb9726975a8cf07c8442c5a2fffdd269d5
+Evidence: sha256:9a9cdc8b673bab79ae96cf5aba5b7895d6e6e5f425407d1bd64da8701a1314e6
 ```
 
 ## What the demo proves
