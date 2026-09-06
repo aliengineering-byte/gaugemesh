@@ -8,11 +8,11 @@
     "url": "https://github.com/aliengineering-byte/gaugemesh",
     "source": "github"
   },
-  "version": "0.2.2",
+  "version": "0.3.0",
   "packages": [
     {
       "registryType": "oci",
-      "identifier": "ghcr.io/aliengineering-byte/gaugemesh:0.2.2",
+      "identifier": "ghcr.io/aliengineering-byte/gaugemesh:0.3.0",
       "transport": {
         "type": "stdio"
       },

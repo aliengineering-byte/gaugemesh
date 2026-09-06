@@ -831,7 +831,7 @@ dependencies = [
 
 [[package]]
 name = "gaugemesh"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -866,7 +866,7 @@ dependencies = [
 
 [[package]]
 name = "gaugemesh-core"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "argon2",
  "base64 0.22.1",
