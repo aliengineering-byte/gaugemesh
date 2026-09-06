@@ -41,8 +41,10 @@ reported as an official client-suite pass. Uninstrumented network/DNS behavior
 and configured live pooling remain outside these counts.
 
 The unscored failures are retained as limits, not expected-failure baselines.
-GaugeMesh does not advertise the `io.modelcontextprotocol/tasks` extension, so
-the ten task scenarios are visible but unsupported. The runner also marks JSON
+The measured `0.1.0` fixture did not advertise the
+`io.modelcontextprotocol/tasks` extension, so the ten task scenarios were
+visible but unsupported. Current source has a conditional durable Tasks route,
+but it is not included in these historical counts. The runner also marks JSON
 Schema 2020-12 and custom-header scenarios as pending; those observed failures
 are not claimed as passes. The exact requirements command exits successfully
 only because every scored requirement passed.

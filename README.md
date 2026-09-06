@@ -268,9 +268,11 @@ boundary is documented in
   shutdown waits are bounded. Cancellation propagates through owned resources.
 
 See [SECURITY.md](SECURITY.md), [THREAT_MODEL.md](THREAT_MODEL.md), and the
-[adversarial evidence](docs/compatibility/ADVERSARIAL.md). GaugeMesh does not
-claim exactly-once execution, production readiness, universal client/provider
-support, official MCP status, MCP certification, or security certification.
+[adversarial evidence](docs/compatibility/ADVERSARIAL.md). The bounded
+[durable MCP Tasks route](docs/guides/DURABLE_TASKS.md) documents its separate
+failure and trust boundaries. GaugeMesh does not claim exactly-once execution,
+production readiness, universal client/provider support, official MCP status,
+MCP certification, or security certification.
 
 ## Verified compatibility
 
@@ -279,14 +281,21 @@ support, official MCP status, MCP certification, or security certification.
 | MCP server, Streamable HTTP, 2025-11-25 | official conformance 0.2.0-alpha.11 | 70/70 scored checks |
 | MCP server, Streamable HTTP, 2026-07-28 | official conformance 0.2.0-alpha.11 | 117/117 scored checks |
 | MCP client, stdio and HTTP, both revisions | RMCP 3.1.4 cross-process/integration tests | VERIFIED subset |
+| MCP Tasks route, 2026-07-28 | RMCP task lifecycle plus neutral child-process qualification with SQLite restart | VERIFIED bounded subset in current source |
 | OpenAI-compatible HTTP | raw HTTP, provider fixture, and OpenAI Python SDK 3.6.0 | VERIFIED subset |
 | Product-specific client installation | not executed | DOCUMENTED_ONLY or UNSUPPORTED |
 
 Conformance-only synthetic capabilities are absent in normal operation. Pending
-or unscored extension checks are not counted, MCP tasks are not advertised, and
-the results are protocol evidence rather than official certification. See the
-[MCP matrix](docs/compatibility/MCP.md), [client levels](docs/compatibility/CLIENTS.md),
-and [conformance inventory](docs/compatibility/CONFORMANCE.md).
+or unscored extension checks are not counted. The recorded `0.1.0` conformance
+run did not advertise Tasks; current source advertises
+`io.modelcontextprotocol/tasks` only for 2026-07-28 when SQLite durable storage
+and at least one task-capable reviewed upstream are available. The caller must
+also declare Tasks support. The task route is integration evidence outside the
+older conformance counts, and none of these results is official certification.
+See the [MCP matrix](docs/compatibility/MCP.md),
+[durable Tasks guide](docs/guides/DURABLE_TASKS.md),
+[client levels](docs/compatibility/CLIENTS.md), and
+[conformance inventory](docs/compatibility/CONFORMANCE.md).
 
 ## ResiliReplay verification
 

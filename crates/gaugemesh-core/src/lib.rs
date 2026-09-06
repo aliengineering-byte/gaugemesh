@@ -17,6 +17,7 @@ pub mod route;
 pub mod runtime;
 pub mod security;
 pub mod storage;
+pub mod task;
 pub mod translation;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

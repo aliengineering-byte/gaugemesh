@@ -1022,10 +1022,14 @@ mod tests {
 
     #[test]
     fn checked_in_schema_matches_generated_score_bounds() {
-        let schema: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../schemas/gaugemesh-route-decision-v1.schema.json"
-        ))
-        .unwrap();
+        let workspace_schema = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../schemas/gaugemesh-route-decision-v1.schema.json");
+        if !workspace_schema.exists() {
+            // A packaged core crate does not own the CLI's schema asset.
+            return;
+        }
+        let schema: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(workspace_schema).unwrap()).unwrap();
         for term in [
             "latency",
             "cost",

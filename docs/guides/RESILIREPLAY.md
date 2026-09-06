@@ -10,7 +10,7 @@ evidence output for a clean control plus every fault exposed by the published
 plan, validates its 64-hex plan SHA-256, then supplies that exact digest with
 `--approve`. Each invocation is an argument array, not a shell command.
 
-Observed local result on 2026-08-30:
+Observed local result on 2026-09-05:
 
 | Scenario | Recovery result |
 |---|---|
@@ -33,7 +33,7 @@ reported zero duplicate effects. The required clean-control, timeout-recovery,
 and deterministic-error recovery gate passed. The combined matrix result is
 therefore `PARTIAL`, not a claim that every mutation recovered. Its combined
 evidence SHA-256 is
-`sha256:9491a090c00a510b9c6e3db1439253eafb23ad67ada3df2c66420abd2bf01bc4`.
+`sha256:0840f893fa37aa71bc0cb8fa3556070e8a79ff541663d8c4118207fad34601bf`.
 The individual plan and evidence digests are emitted by
 `gaugemesh verify --resilireplay`.
 

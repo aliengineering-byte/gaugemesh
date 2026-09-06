@@ -441,24 +441,65 @@ mod tests {
 
     use super::*;
 
+    const LOCAL_DEMO_YAML: &str = r#"version: 1
+runtime:
+  mode: memory
+listeners:
+  data_address: 127.0.0.1:8090
+  admin_address: 127.0.0.1:8092
+routing:
+  weights:
+    latency: 10
+    cost: 30
+    failure: 30
+    semantic_loss: 1000
+    pressure: 20
+    exposure: 50
+    switching: 10
+  max_queue_per_tenant: 32
+  max_concurrent_per_tenant: 4
+policy:
+  default: deny
+  rules: []
+mcp_sources: []
+models: []
+"#;
+
     fn fixture() -> Config {
-        serde_yaml::from_str(include_str!("../../../examples/local-demo/gaugemesh.yaml")).unwrap()
+        serde_yaml::from_str(LOCAL_DEMO_YAML).unwrap()
+    }
+
+    #[test]
+    fn embedded_local_fixture_matches_workspace_copy() {
+        let workspace_fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/local-demo/gaugemesh.yaml");
+        if workspace_fixture.exists() {
+            assert_eq!(
+                LOCAL_DEMO_YAML.as_bytes(),
+                std::fs::read(workspace_fixture).unwrap()
+            );
+        }
     }
 
     #[test]
     fn checked_in_schema_matches_the_typed_configuration() {
-        let expected: Value = serde_json::from_str(include_str!(
-            "../../../schemas/gaugemesh-config-v1.schema.json"
-        ))
-        .unwrap();
+        let workspace_schema = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../schemas/gaugemesh-config-v1.schema.json");
+        if !workspace_schema.exists() {
+            // The library package does not own the workspace-level generated schema.
+            return;
+        }
+        let expected: Value =
+            serde_json::from_slice(&std::fs::read(workspace_schema).unwrap()).unwrap();
         let actual = serde_json::to_value(schemars::schema_for!(Config)).unwrap();
         assert_eq!(actual, expected);
     }
 
     #[test]
     fn unknown_fields_and_unauthenticated_remote_listeners_fail_closed() {
-        let yaml = include_str!("../../../examples/local-demo/gaugemesh.yaml");
-        assert!(serde_yaml::from_str::<Config>(&format!("{yaml}unknown: true\n")).is_err());
+        assert!(
+            serde_yaml::from_str::<Config>(&format!("{LOCAL_DEMO_YAML}unknown: true\n")).is_err()
+        );
 
         let mut config = fixture();
         config.listeners.data_address = "0.0.0.0:8090".into();

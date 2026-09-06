@@ -1,4 +1,7 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use crate::auth::AuthenticatedIdentity;
 use anyhow::{Context, Result, bail};
@@ -717,18 +720,31 @@ fn maybe_execute_tool(
         let tenant = identity
             .map(|identity| identity.tenant.clone())
             .unwrap_or_else(|| TenantId("local".into()));
+        let now_unix_ms = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .context("GM_CLOCK_INVALID")?
+                .as_millis(),
+        )
+        .context("GM_CLOCK_INVALID")?;
         let lease = CapabilityLease::issue(
             principal.clone(),
             tenant.clone(),
             causal_parent.to_string(),
             vec![tool.identity.clone()],
             CapabilityScope::default(),
-            1_000,
+            now_unix_ms.saturating_add(1_000),
             MoneyBudgetMicros(0),
             TokenBudget(4_096),
             RetryBudget(0),
         );
-        lease.authorize_invocation(&principal, &tenant, &tool.identity, tool.side_effect, 0)?;
+        lease.authorize_invocation(
+            &principal,
+            &tenant,
+            &tool.identity,
+            tool.side_effect,
+            now_unix_ms,
+        )?;
     }
     let result = json!({"query": query, "fixture": tool.fixture_result});
     if serde_json::to_vec(&result)?.len() > MAX_TOOL_OUTPUT_BYTES {

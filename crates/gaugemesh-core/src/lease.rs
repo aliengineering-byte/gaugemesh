@@ -27,6 +27,8 @@ pub struct CapabilityLease {
     pub request_identity: String,
     pub capabilities: Vec<CapabilityId>,
     pub scope: CapabilityScope,
+    /// Absolute Unix-millisecond expiry. The historical field name is retained
+    /// for source and serialized-shape compatibility.
     pub expires_at_monotonic_ms: u64,
     pub monetary_budget: MoneyBudgetMicros,
     pub token_budget: TokenBudget,
@@ -126,9 +128,9 @@ impl CapabilityLease {
         principal: &PrincipalId,
         tenant: &TenantId,
         capability: &CapabilityId,
-        now_monotonic_ms: u64,
+        now_unix_ms: u64,
     ) -> Result<(), LeaseError> {
-        if now_monotonic_ms >= self.expires_at_monotonic_ms {
+        if now_unix_ms >= self.expires_at_monotonic_ms {
             return Err(LeaseError::Expired);
         }
         if principal != &self.principal {
@@ -173,9 +175,9 @@ impl CapabilityLease {
         tenant: &TenantId,
         capability: &CapabilityId,
         side_effect: SideEffectClass,
-        now_monotonic_ms: u64,
+        now_unix_ms: u64,
     ) -> Result<(), LeaseError> {
-        self.authorize(principal, tenant, capability, now_monotonic_ms)?;
+        self.authorize(principal, tenant, capability, now_unix_ms)?;
         if self.side_effects.contains(&side_effect) {
             Ok(())
         } else {
@@ -191,7 +193,7 @@ fn manifest_digest(
     request_identity: &str,
     capabilities: &[CapabilityId],
     scope: &CapabilityScope,
-    expires_at_monotonic_ms: u64,
+    expires_at_unix_ms: u64,
     monetary_budget: MoneyBudgetMicros,
     token_budget: TokenBudget,
     retry_budget: RetryBudget,
@@ -203,7 +205,7 @@ fn manifest_digest(
         "requestIdentity": request_identity,
         "capabilities": capabilities,
         "scope": scope,
-        "expiresAtMonotonicMs": expires_at_monotonic_ms,
+        "expiresAtUnixMs": expires_at_unix_ms,
         "monetaryBudget": monetary_budget,
         "tokenBudget": token_budget,
         "retryBudget": retry_budget,
@@ -277,9 +279,76 @@ mod tests {
     }
 
     #[test]
-    fn expiry_uses_monotonic_deadline() {
+    fn expiry_uses_persistable_unix_deadline() {
         assert_eq!(
             lease().authorize(
+                &PrincipalId("alice".into()),
+                &TenantId("tenant-a".into()),
+                &capability("v1"),
+                99,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            lease().authorize(
+                &PrincipalId("alice".into()),
+                &TenantId("tenant-a".into()),
+                &capability("v1"),
+                100,
+            ),
+            Err(LeaseError::Expired)
+        );
+    }
+
+    #[test]
+    fn unix_expiry_is_manifest_bound() {
+        let mut tampered = lease();
+        tampered.expires_at_monotonic_ms += 1;
+        assert_eq!(
+            tampered.authorize(
+                &PrincipalId("alice".into()),
+                &TenantId("tenant-a".into()),
+                &capability("v1"),
+                0,
+            ),
+            Err(LeaseError::Manifest)
+        );
+    }
+
+    #[test]
+    fn legacy_monotonic_json_does_not_extend_a_lease_after_restart() {
+        let original = lease();
+        let legacy_manifest_digest = Sha256Digest::of_json(&serde_json::json!({
+            "principal": original.principal,
+            "tenant": original.tenant,
+            "requestIdentity": original.request_identity,
+            "capabilities": original.capabilities,
+            "scope": original.scope,
+            "expiresAtMonotonicMs": original.expires_at_monotonic_ms,
+            "monetaryBudget": original.monetary_budget,
+            "tokenBudget": original.token_budget,
+            "retryBudget": original.retry_budget,
+            "sideEffects": original.side_effects,
+        }));
+        let mut document = serde_json::to_value(&original).unwrap();
+        document.as_object_mut().unwrap().insert(
+            "manifest_digest".into(),
+            serde_json::to_value(legacy_manifest_digest).unwrap(),
+        );
+
+        let restored: CapabilityLease = serde_json::from_value(document).unwrap();
+        assert_eq!(restored.expires_at_monotonic_ms, 100);
+        assert_eq!(
+            restored.authorize(
+                &PrincipalId("alice".into()),
+                &TenantId("tenant-a".into()),
+                &capability("v1"),
+                0,
+            ),
+            Err(LeaseError::Manifest)
+        );
+        assert_eq!(
+            restored.authorize(
                 &PrincipalId("alice".into()),
                 &TenantId("tenant-a".into()),
                 &capability("v1"),

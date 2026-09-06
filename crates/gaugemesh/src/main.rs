@@ -16,7 +16,7 @@ use gaugemesh_core::{
         ConstraintResult, RouteCandidate, RouteDecision, RouteId, RouteMetricSnapshot,
         RouteWeights, decide, plan,
     },
-    storage::{LeaseStorage, MemoryStorage, SqliteStorage},
+    storage::{LeaseStorage, MemoryStorage, SqliteStorage, TaskRouteStorage},
 };
 
 mod admission;
@@ -27,6 +27,7 @@ mod model;
 mod outbound;
 mod policy_gate;
 mod registry;
+mod task_proxy;
 mod verify;
 
 #[derive(Debug, Parser)]
@@ -212,7 +213,7 @@ async fn main() -> Result<()> {
             RouteCommand::Schema => {
                 print!(
                     "{}",
-                    include_str!("../../../schemas/gaugemesh-route-decision-v1.schema.json")
+                    include_str!("../assets/gaugemesh-route-decision-v1.schema.json")
                 );
                 Ok(())
             }
@@ -389,19 +390,31 @@ fn demo(keep: bool, output: Option<PathBuf>, json_output: bool) -> Result<()> {
         && tools[0].identity != tools[1].identity;
     let principal = PrincipalId("local-demo".into());
     let tenant = TenantId("local".into());
+    let now_unix_ms = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis(),
+    )
+    .context("GM_CLOCK_INVALID")?;
     let lease = CapabilityLease::issue(
         principal.clone(),
         tenant.clone(),
         "demo-request".into(),
         tools.iter().map(|tool| tool.identity.clone()).collect(),
         CapabilityScope::default(),
-        1_000,
+        now_unix_ms.saturating_add(1_000),
         MoneyBudgetMicros(0),
         TokenBudget(4_096),
         RetryBudget(1),
     );
     for tool in &tools {
-        lease.authorize_invocation(&principal, &tenant, &tool.identity, tool.side_effect, 0)?;
+        lease.authorize_invocation(
+            &principal,
+            &tenant,
+            &tool.identity,
+            tool.side_effect,
+            now_unix_ms,
+        )?;
     }
     let route = plan(
         vec![
@@ -716,9 +729,15 @@ async fn runtime_mcp(
     gaugemesh_core::federation::Federation,
     Option<std::sync::Arc<outbound::UpstreamRuntime>>,
 )> {
-    let lease_storage: std::sync::Arc<dyn LeaseStorage> = match &config.runtime {
-        RuntimeConfig::Memory => std::sync::Arc::new(MemoryStorage::default()),
-        RuntimeConfig::Sqlite { database } => std::sync::Arc::new(SqliteStorage::open(database)?),
+    let (lease_storage, task_routes): (
+        std::sync::Arc<dyn LeaseStorage>,
+        Option<std::sync::Arc<dyn TaskRouteStorage>>,
+    ) = match &config.runtime {
+        RuntimeConfig::Memory => (std::sync::Arc::new(MemoryStorage::default()), None),
+        RuntimeConfig::Sqlite { database } => {
+            let storage = std::sync::Arc::new(SqliteStorage::open(database)?);
+            (storage.clone(), Some(storage))
+        }
     };
     if config.mcp_sources.is_empty() {
         let federation = gaugemesh_core::federation::Federation::demo();
@@ -726,6 +745,7 @@ async fn runtime_mcp(
             federation.clone(),
             None,
             lease_storage,
+            task_routes,
             config.capability_mode,
         );
         return Ok((server, federation, None));
@@ -740,6 +760,7 @@ async fn runtime_mcp(
         federation.clone(),
         Some(upstreams.clone()),
         lease_storage,
+        task_routes,
         config.capability_mode,
     );
     Ok((server, federation, Some(upstreams)))
@@ -1017,6 +1038,17 @@ fn default_weights() -> RouteWeights {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packaged_route_schema_matches_workspace_copy() {
+        let packaged = include_bytes!("../assets/gaugemesh-route-decision-v1.schema.json");
+        serde_json::from_slice::<serde_json::Value>(packaged).unwrap();
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../schemas/gaugemesh-route-decision-v1.schema.json");
+        if workspace.exists() {
+            assert_eq!(packaged.as_slice(), std::fs::read(workspace).unwrap());
+        }
+    }
 
     #[tokio::test]
     async fn cancellation_releases_owned_data_and_admin_listeners() {
