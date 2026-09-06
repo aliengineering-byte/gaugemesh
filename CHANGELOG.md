@@ -4,6 +4,28 @@ All notable changes are documented here.
 
 ## Unreleased
 
+- Add a bounded, SQLite-backed MCP 2026-07-28 Tasks route with caller-scoped
+  idempotency, persisted dispatch ownership, public task IDs, conservative
+  reconciliation, explicit effect authority, and neutral process qualification.
+- Preserve the 2025-11-25 surface without Tasks and reject task-shaped upstream
+  responses outside the durable submission path.
+- Fence task lifecycle traffic to the exact upstream connection session, and
+  require a persisted capability-manifest pin before a source is task-eligible.
+- Bound upstream discovery pages, items, cursor size, and aggregate bytes; use
+  one captured view for routing identities and restart drift checks.
+- Preserve pinned provider annotations as descriptive classifications for
+  ordinary calls, while every durable external task requires an explicit
+  `non_idempotent_write` lease grant and matching submission effect.
+- Interpret the existing lease-expiry field as an absolute Unix-millisecond
+  deadline so SQLite leases remain safe across restart; legacy monotonic-time
+  manifests fail closed and must be reissued.
+- Expose the existing neutral durable-Tasks qualification through the native
+  binary and packaged-archive smoke path, including real subprocess/stdio,
+  SQLite reopen, artifact rejection, and poll-driven deadline evidence.
+- Correct the ResiliReplay matrix so one real clean trace plus twelve explicit
+  fault runs form the 13 rows; document that 0.7.0 fault mutation occurs in its
+  recorded trace rather than on the MCP wire.
+
 ## 0.2.2 - 2026-09-03
 
 - Make GitHub Releases and the multi-architecture GHCR image the supported no-crates distribution paths; crate publication is disabled.

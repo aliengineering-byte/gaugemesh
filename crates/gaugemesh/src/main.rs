@@ -16,7 +16,7 @@ use gaugemesh_core::{
         ConstraintResult, RouteCandidate, RouteDecision, RouteId, RouteMetricSnapshot,
         RouteWeights, decide, plan,
     },
-    storage::{LeaseStorage, MemoryStorage, SqliteStorage},
+    storage::{LeaseStorage, MemoryStorage, SqliteStorage, TaskRouteStorage},
 };
 
 mod admission;
@@ -27,6 +27,7 @@ mod model;
 mod outbound;
 mod policy_gate;
 mod registry;
+mod task_proxy;
 mod verify;
 
 #[derive(Debug, Parser)]
@@ -104,8 +105,11 @@ enum Command {
     },
     /// Run bounded reliability verification.
     Verify {
-        #[arg(long)]
+        #[arg(long, conflicts_with = "durable_tasks")]
         resilireplay: bool,
+        /// Exercise durable Tasks through this packaged binary and its neutral worker.
+        #[arg(long, conflicts_with = "resilireplay")]
+        durable_tasks: bool,
     },
     /// Print tested client connection configuration.
     Connect {
@@ -120,6 +124,13 @@ enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    #[command(name = "__neutral-upstream", hide = true)]
+    NeutralUpstream {
+        #[arg(long)]
+        root: PathBuf,
+    },
+    #[command(name = "__neutral-worker", hide = true)]
+    NeutralWorker,
 }
 
 #[derive(Debug, Subcommand)]
@@ -212,7 +223,7 @@ async fn main() -> Result<()> {
             RouteCommand::Schema => {
                 print!(
                     "{}",
-                    include_str!("../../../schemas/gaugemesh-route-decision-v1.schema.json")
+                    include_str!("../assets/gaugemesh-route-decision-v1.schema.json")
                 );
                 Ok(())
             }
@@ -232,11 +243,24 @@ async fn main() -> Result<()> {
             admin_address,
         } => serve(config.as_deref(), data_address, admin_address).await,
         Command::McpStdio { config } => serve_stdio(config.as_deref()).await,
+        Command::NeutralUpstream { root } => {
+            outbound::qualification::serve_neutral_upstream(root).await
+        }
+        Command::NeutralWorker => outbound::qualification::run_neutral_worker_from_environment(),
         Command::Add { kind } => add(kind).await,
         Command::Remove { id, config } => remove(&config, &id),
         Command::List { config } => list(&config),
         Command::Registry { command } => registry::execute(command).await,
-        Command::Verify { resilireplay } => verify::execute(resilireplay).await,
+        Command::Verify {
+            resilireplay,
+            durable_tasks,
+        } => {
+            if durable_tasks {
+                outbound::qualification::execute().await
+            } else {
+                verify::execute(resilireplay).await
+            }
+        }
         Command::Connect { client, base_url } => connect(&client, &base_url),
     }
 }
@@ -389,19 +413,29 @@ fn demo(keep: bool, output: Option<PathBuf>, json_output: bool) -> Result<()> {
         && tools[0].identity != tools[1].identity;
     let principal = PrincipalId("local-demo".into());
     let tenant = TenantId("local".into());
+    // The demo is a deterministic fixture, so its clock must be part of the
+    // fixture rather than ambient wall time. Production lease checks use the
+    // actual Unix clock at their call sites.
+    let now_unix_ms: u64 = 1_893_456_000_000;
     let lease = CapabilityLease::issue(
         principal.clone(),
         tenant.clone(),
         "demo-request".into(),
         tools.iter().map(|tool| tool.identity.clone()).collect(),
         CapabilityScope::default(),
-        1_000,
+        now_unix_ms.saturating_add(1_000),
         MoneyBudgetMicros(0),
         TokenBudget(4_096),
         RetryBudget(1),
     );
     for tool in &tools {
-        lease.authorize_invocation(&principal, &tenant, &tool.identity, tool.side_effect, 0)?;
+        lease.authorize_invocation(
+            &principal,
+            &tenant,
+            &tool.identity,
+            tool.side_effect,
+            now_unix_ms,
+        )?;
     }
     let route = plan(
         vec![
@@ -716,9 +750,15 @@ async fn runtime_mcp(
     gaugemesh_core::federation::Federation,
     Option<std::sync::Arc<outbound::UpstreamRuntime>>,
 )> {
-    let lease_storage: std::sync::Arc<dyn LeaseStorage> = match &config.runtime {
-        RuntimeConfig::Memory => std::sync::Arc::new(MemoryStorage::default()),
-        RuntimeConfig::Sqlite { database } => std::sync::Arc::new(SqliteStorage::open(database)?),
+    let (lease_storage, task_routes): (
+        std::sync::Arc<dyn LeaseStorage>,
+        Option<std::sync::Arc<dyn TaskRouteStorage>>,
+    ) = match &config.runtime {
+        RuntimeConfig::Memory => (std::sync::Arc::new(MemoryStorage::default()), None),
+        RuntimeConfig::Sqlite { database } => {
+            let storage = std::sync::Arc::new(SqliteStorage::open(database)?);
+            (storage.clone(), Some(storage))
+        }
     };
     if config.mcp_sources.is_empty() {
         let federation = gaugemesh_core::federation::Federation::demo();
@@ -726,6 +766,7 @@ async fn runtime_mcp(
             federation.clone(),
             None,
             lease_storage,
+            task_routes,
             config.capability_mode,
         );
         return Ok((server, federation, None));
@@ -740,6 +781,7 @@ async fn runtime_mcp(
         federation.clone(),
         Some(upstreams.clone()),
         lease_storage,
+        task_routes,
         config.capability_mode,
     );
     Ok((server, federation, Some(upstreams)))
@@ -1017,6 +1059,17 @@ fn default_weights() -> RouteWeights {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packaged_route_schema_matches_workspace_copy() {
+        let packaged = include_bytes!("../assets/gaugemesh-route-decision-v1.schema.json");
+        serde_json::from_slice::<serde_json::Value>(packaged).unwrap();
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../schemas/gaugemesh-route-decision-v1.schema.json");
+        if workspace.exists() {
+            assert_eq!(packaged.as_slice(), std::fs::read(workspace).unwrap());
+        }
+    }
 
     #[tokio::test]
     async fn cancellation_releases_owned_data_and_admin_listeners() {

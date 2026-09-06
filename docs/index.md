@@ -17,6 +17,7 @@ semantics, and causal evidence while routing MCP capabilities and model requests
 - [Adversarial evidence](compatibility/ADVERSARIAL.md)
 - [Performance evidence](compatibility/PERFORMANCE.md)
 - [Configuration boundaries](guides/CONFIGURATION.md)
+- [Durable MCP Tasks routing](guides/DURABLE_TASKS.md)
 - [ResiliReplay verification](guides/RESILIREPLAY.md)
 - [Threat model](https://github.com/aliengineering-byte/gaugemesh/blob/main/THREAT_MODEL.md)
 

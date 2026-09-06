@@ -5,20 +5,19 @@ use serde_json::{Value, json};
 
 const RESILIREPLAY_VERSION: &str = "0.7.0";
 const TEST_TOOL: &str = "docs-a__search";
-const TEST_FAULTS: &[Option<&str>] = &[
-    None,
-    Some("mcp-malformed-tools-list"),
-    Some("mcp-renamed-tool"),
-    Some("mcp-missing-tool"),
-    Some("mcp-incompatible-argument-schema"),
-    Some("mcp-tool-timeout"),
-    Some("mcp-tool-error"),
-    Some("mcp-oversized-content"),
-    Some("mcp-protocol-version-mismatch"),
-    Some("mcp-invalid-jsonrpc-id"),
-    Some("mcp-malicious-canary-instruction"),
-    Some("mcp-permission-capability-mismatch"),
-    Some("mcp-canary-secret-leakage-attempt"),
+const TEST_FAULTS: &[&str] = &[
+    "mcp-malformed-tools-list",
+    "mcp-renamed-tool",
+    "mcp-missing-tool",
+    "mcp-incompatible-argument-schema",
+    "mcp-tool-timeout",
+    "mcp-tool-error",
+    "mcp-oversized-content",
+    "mcp-protocol-version-mismatch",
+    "mcp-invalid-jsonrpc-id",
+    "mcp-malicious-canary-instruction",
+    "mcp-permission-capability-mismatch",
+    "mcp-canary-secret-leakage-attempt",
 ];
 
 pub async fn execute(resilireplay: bool) -> Result<()> {
@@ -45,9 +44,15 @@ pub async fn execute(resilireplay: bool) -> Result<()> {
     )
     .context("GM_VERIFY_CONFIG_WRITE")?;
 
-    let mut scenarios = Vec::with_capacity(TEST_FAULTS.len());
+    // `resilireplay mcp test` always runs one genuine clean control before its
+    // selected fault. Omitting `--fault` does not request a clean-only run: in
+    // 0.7.0 it selects `mcp-tool-error`. Derive the one clean-control row from
+    // the first campaign's actual clean trace, then execute each of the twelve
+    // explicit faults exactly once. This keeps the 13-scenario denominator
+    // honest and avoids relabelling a second tool-error campaign as clean.
+    let mut scenarios = Vec::with_capacity(TEST_FAULTS.len() + 1);
     for fault in TEST_FAULTS {
-        let name = fault.unwrap_or("clean-control");
+        let name = *fault;
         let mut common = vec![
             "mcp".into(),
             "test".into(),
@@ -67,10 +72,8 @@ pub async fn execute(resilireplay: bool) -> Result<()> {
             format!("evidence/{name}"),
             "--no-regression".into(),
         ];
-        if let Some(fault) = fault {
-            common.push("--fault".into());
-            common.push((*fault).into());
-        }
+        common.push("--fault".into());
+        common.push(name.into());
         let dry = run_resilireplay(
             directory.path(),
             &common,
@@ -90,18 +93,14 @@ pub async fn execute(resilireplay: bool) -> Result<()> {
             .get("result")
             .and_then(Value::as_str)
             .context("GM_VERIFY_RESULT_MISSING")?;
-        if result.get("cleanupComplete").and_then(Value::as_bool) != Some(true)
+        if result.get("cleanControl").and_then(Value::as_str) != Some("PASS")
+            || result.get("cleanupComplete").and_then(Value::as_bool) != Some(true)
             || result.get("duplicateEffects").and_then(Value::as_u64) != Some(0)
-            || (fault.is_some()
-                && result.get("faultObserved").and_then(Value::as_bool) != Some(true))
+            || result.get("faultObserved").and_then(Value::as_bool) != Some(true)
         {
             bail!("GM_VERIFY_RESULT_FAILED:{name}");
         }
-        if matches!(
-            name,
-            "clean-control" | "mcp-tool-timeout" | "mcp-tool-error"
-        ) && recovery_result != "PASS"
-        {
+        if matches!(name, "mcp-tool-timeout" | "mcp-tool-error") && recovery_result != "PASS" {
             bail!("GM_VERIFY_REQUIRED_RECOVERY_FAILED:{name}");
         }
         let evidence = digest_field(
@@ -109,21 +108,50 @@ pub async fn execute(resilireplay: bool) -> Result<()> {
             "evidenceSha256",
             "GM_VERIFY_EVIDENCE_DIGEST_MISSING",
         )?;
+        if scenarios.is_empty() {
+            let clean_trace = directory
+                .path()
+                .join("evidence")
+                .join(name)
+                .join("clean-control.jsonl");
+            let clean_bytes = std::fs::read(&clean_trace)
+                .with_context(|| format!("GM_VERIFY_CLEAN_TRACE_READ:{}", clean_trace.display()))?;
+            scenarios.push(json!({
+                "scenario": "clean-control",
+                "fault": null,
+                "result": "PASS",
+                "recoveryResult": null,
+                "evidenceKind": "resilireplay-clean-control-trace",
+                "evidenceSha256": gaugemesh_core::digest::Sha256Digest::of_bytes(&clean_bytes).to_string(),
+                "sourceFaultScenario": name,
+                "cleanupComplete": true,
+                "faultObserved": false,
+                "duplicateEffects": null,
+            }));
+        }
         scenarios.push(json!({
             "scenario": name,
-            "fault": fault,
+            "fault": name,
+            "result": recovery_result,
             "planSha256": plan,
             "evidenceSha256": evidence,
             "recoveryResult": recovery_result,
+            "cleanControl": "PASS",
             "cleanupComplete": true,
+            "faultObserved": true,
             "duplicateEffects": 0,
         }));
     }
     let evidence = gaugemesh_core::digest::Sha256Digest::of_json(&Value::Array(scenarios.clone()));
+    let matrix_passes = scenarios
+        .iter()
+        .filter(|scenario| scenario.get("result").and_then(Value::as_str) == Some("PASS"))
+        .count();
     let recovery_passes = scenarios
         .iter()
         .filter(|scenario| scenario.get("recoveryResult").and_then(Value::as_str) == Some("PASS"))
         .count();
+    let recovery_attempts = TEST_FAULTS.len();
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
@@ -134,12 +162,16 @@ pub async fn execute(resilireplay: bool) -> Result<()> {
             "tool": TEST_TOOL,
             "scenarios": scenarios,
             "combinedEvidenceSha256": evidence.to_string(),
-            "result": if recovery_passes == scenarios.len() { "PASS" } else { "PARTIAL" },
+            "result": if matrix_passes == scenarios.len() { "PASS" } else { "PARTIAL" },
+            "matrixPasses": matrix_passes,
+            "matrixFailures": scenarios.len() - matrix_passes,
+            "cleanControls": 1,
+            "recoveryAttempts": recovery_attempts,
             "recoveryPasses": recovery_passes,
-            "recoveryFailures": scenarios.len() - recovery_passes,
+            "recoveryFailures": recovery_attempts - recovery_passes,
             "requiredRecoveryGate": "PASS",
             "cleanupComplete": true,
-            "duplicateEffects": 0,
+            "duplicateEffectsAcrossFaultRuns": 0,
             "mcpRes": null,
             "certification": false
         }))?

@@ -1,17 +1,22 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
-use crate::{auth::AuthenticatedIdentity, outbound::UpstreamRuntime};
+use crate::{auth::AuthenticatedIdentity, outbound::UpstreamRuntime, task_proxy::TaskProxy};
 use anyhow::{Context, Result};
 use gaugemesh_core::{
     capability::CapabilityId,
     config::CapabilityMode,
     context::{
-        CapabilityScope, MoneyBudgetMicros, PrincipalId, RetryBudget, TenantId, TokenBudget,
+        CapabilityScope, MoneyBudgetMicros, PrincipalId, RetryBudget, SideEffectClass, TenantId,
+        TokenBudget,
     },
     digest::Sha256Digest,
     federation::{CompositeCursor, FederatedTool, Federation, open_cursor, seal_cursor},
     lease::{CapabilityLease, LeaseError},
-    storage::{LeaseStorage, MemoryStorage},
+    storage::{LeaseStorage, MemoryStorage, TaskRouteStorage},
 };
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
@@ -28,11 +33,11 @@ pub struct MeshMcpServer {
 struct MeshMcpState {
     federation: Federation,
     leases: Arc<dyn LeaseStorage>,
-    started: std::time::Instant,
     upstreams: Option<Arc<UpstreamRuntime>>,
     capability_mode: CapabilityMode,
     cursor_key: [u8; 32],
     conformance_fixture: bool,
+    task_proxy: Option<TaskProxy>,
 }
 
 impl MeshMcpServer {
@@ -41,11 +46,11 @@ impl MeshMcpServer {
             state: Arc::new(MeshMcpState {
                 federation: Federation::demo(),
                 leases: Arc::new(MemoryStorage::default()),
-                started: std::time::Instant::now(),
                 upstreams: None,
                 capability_mode: CapabilityMode::Transparent,
                 cursor_key: *Sha256Digest::of_bytes(uuid::Uuid::new_v4().as_bytes()).as_bytes(),
                 conformance_fixture: std::env::var_os("GAUGEMESH_CONFORMANCE_FIXTURE").is_some(),
+                task_proxy: None,
             }),
         }
     }
@@ -54,17 +59,24 @@ impl MeshMcpServer {
         federation: Federation,
         upstreams: Option<Arc<UpstreamRuntime>>,
         leases: Arc<dyn LeaseStorage>,
+        task_routes: Option<Arc<dyn TaskRouteStorage>>,
         capability_mode: CapabilityMode,
     ) -> Self {
+        let task_proxy = task_routes.and_then(|store| {
+            upstreams
+                .as_ref()
+                .filter(|runtime| runtime.has_task_capable_source())
+                .map(|runtime| TaskProxy::new(store, runtime.clone()))
+        });
         Self {
             state: Arc::new(MeshMcpState {
                 federation,
                 leases,
-                started: std::time::Instant::now(),
                 upstreams,
                 capability_mode,
                 cursor_key: *Sha256Digest::of_bytes(uuid::Uuid::new_v4().as_bytes()).as_bytes(),
                 conformance_fixture: std::env::var_os("GAUGEMESH_CONFORMANCE_FIXTURE").is_some(),
+                task_proxy,
             }),
         }
     }
@@ -201,13 +213,58 @@ impl MeshMcpServer {
             ),
             (
                 "gaugemesh_lease",
-                "Issue a bounded local capability lease",
-                json!({"type":"object","properties":{"aliases":{"type":"array","items":{"type":"string"},"maxItems":32},"ttlMs":{"type":"integer","minimum":1,"maximum":600000}},"required":["aliases"],"additionalProperties":false}),
+                "Issue a bounded capability lease with explicit side-effect authority",
+                json!({"type":"object","properties":{"aliases":{"type":"array","items":{"type":"string"},"maxItems":32},"ttlMs":{"type":"integer","minimum":1,"maximum":600000},"sideEffects":{"type":"array","items":{"enum":["read_only","idempotent_write","non_idempotent_write"]},"minItems":1,"maxItems":3,"uniqueItems":true}},"required":["aliases"],"additionalProperties":false}),
             ),
             (
                 "gaugemesh_invoke",
                 "Invoke a capability inside an exact lease",
                 json!({"type":"object","properties":{"leaseId":{"type":"string"},"alias":{"type":"string"},"arguments":{"type":"object"}},"required":["leaseId","alias"],"additionalProperties":false}),
+            ),
+            (
+                "gaugemesh_submit",
+                "Submit one versioned, caller-idempotent capability request through a durable MCP task route",
+                json!({
+                    "type":"object",
+                    "properties":{
+                        "leaseId":{"type":"string"},
+                        "alias":{"type":"string"},
+                        "arguments":{"type":"object"},
+                        "task":{
+                            "type":"object",
+                            "properties":{
+                                "schemaVersion":{"const":"gaugemesh.task-submission/1"},
+                                "logicalTaskId":{"type":"string","minLength":1,"maxLength":128},
+                                "attemptId":{"type":"string","minLength":1,"maxLength":128},
+                                "correlationId":{"type":"string","minLength":1,"maxLength":128},
+                                "idempotencyKey":{"type":"string","minLength":1,"maxLength":128},
+                                "inputSha256":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},
+                                "acceptancePolicySha256":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},
+                                "artifactScopeSha256":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},
+                                "providerInterfaceVersion":{"type":"string","minLength":1,"maxLength":128},
+                                "deadlineUnixMs":{"type":"integer","minimum":1},
+                                "retentionMs":{"type":"integer","minimum":1,"maximum":3600000},
+                                "limits":{
+                                    "type":"object",
+                                    "properties":{
+                                        "maxRuntimeMs":{"type":"integer","minimum":1,"maximum":30000},
+                                        "maxOutputBytes":{"type":"integer","minimum":1,"maximum":65536},
+                                        "maxArtifactBytes":{"type":"integer","minimum":1,"maximum":8388608},
+                                        "maxAttempts":{"const":1}
+                                    },
+                                    "required":["maxRuntimeMs","maxOutputBytes","maxArtifactBytes","maxAttempts"],
+                                    "additionalProperties":false
+                                },
+                                "permittedEffect":{"const":"non_idempotent_write"},
+                                "cleanupRequired":{"const":true}
+                            },
+                            "required":["schemaVersion","logicalTaskId","attemptId","correlationId","idempotencyKey","inputSha256","acceptancePolicySha256","artifactScopeSha256","providerInterfaceVersion","deadlineUnixMs","retentionMs","limits","permittedEffect","cleanupRequired"],
+                            "additionalProperties":false
+                        }
+                    },
+                    "required":["leaseId","alias","arguments","task"],
+                    "additionalProperties":false
+                }),
             ),
             (
                 "gaugemesh_release",
@@ -217,6 +274,14 @@ impl MeshMcpServer {
         ]
         .into_iter()
         .map(|(name, description, schema)| {
+            let (read_only, destructive, idempotent, open_world) = match name {
+                "gaugemesh_invoke" | "gaugemesh_submit" => {
+                    (Some(false), Some(true), Some(false), Some(true))
+                }
+                "gaugemesh_lease" => (Some(false), Some(false), Some(false), Some(false)),
+                "gaugemesh_release" => (Some(false), Some(false), Some(true), Some(false)),
+                _ => (Some(true), Some(false), Some(true), Some(false)),
+            };
             Tool::new(
                 name,
                 description,
@@ -224,10 +289,10 @@ impl MeshMcpServer {
             )
             .with_annotations(ToolAnnotations::from_raw(
                 None,
-                Some(name != "gaugemesh_invoke"),
-                Some(false),
-                Some(true),
-                Some(false),
+                read_only,
+                destructive,
+                idempotent,
+                open_world,
             ))
         })
         .collect()
@@ -710,6 +775,7 @@ impl MeshMcpServer {
         name: &str,
         arguments: Option<Map<String, Value>>,
         identity: &AuthenticatedIdentity,
+        client_supports_tasks: bool,
     ) -> Result<CallToolResponse, McpError> {
         let arguments = arguments.unwrap_or_default();
         match name {
@@ -741,35 +807,59 @@ impl MeshMcpServer {
                 }
             }
             "gaugemesh_lease" => {
-                let aliases = arguments
-                    .get("aliases")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-                let capabilities = aliases
+                let Some(aliases) = arguments.get("aliases").and_then(Value::as_array) else {
+                    return Ok(tool_error("GM_LEASE_CAPABILITY_OUTSIDE_CONE").into());
+                };
+                if aliases.is_empty() || aliases.len() > 32 {
+                    return Ok(tool_error("GM_LEASE_LIMIT_INVALID").into());
+                }
+                let tools = aliases
                     .iter()
                     .filter_map(Value::as_str)
                     .filter_map(|alias| self.state.federation.tool(alias).ok())
-                    .map(|tool| tool.identity.clone())
                     .collect::<Vec<_>>();
-                if capabilities.len() != aliases.len() || capabilities.is_empty() {
+                if tools.len() != aliases.len() || tools.is_empty() {
                     return Ok(tool_error("GM_LEASE_CAPABILITY_OUTSIDE_CONE").into());
                 }
-                let ttl_ms = arguments
-                    .get("ttlMs")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(60_000)
-                    .min(600_000);
-                let lease = CapabilityLease::issue(
+                let side_effects = match explicit_side_effects(arguments.get("sideEffects")) {
+                    Ok(side_effects) => side_effects,
+                    Err(code) => return Ok(tool_error(code).into()),
+                };
+                if side_effects
+                    .iter()
+                    .any(|effect| !identity_authorizes_effect(identity, *effect))
+                {
+                    return Ok(tool_error("GM_LEASE_SIDE_EFFECT_SCOPE_REQUIRED").into());
+                }
+                if tools
+                    .iter()
+                    .any(|tool| !side_effects.contains(&tool.side_effect))
+                {
+                    return Ok(tool_error("GM_LEASE_SIDE_EFFECT_OUTSIDE_CONE").into());
+                }
+                let capabilities = tools
+                    .iter()
+                    .map(|tool| tool.identity.clone())
+                    .collect::<Vec<_>>();
+                let ttl_ms = match arguments.get("ttlMs") {
+                    None => 60_000,
+                    Some(value) => match value.as_u64() {
+                        Some(value @ 1..=600_000) => value,
+                        _ => return Ok(tool_error("GM_LEASE_LIMIT_INVALID").into()),
+                    },
+                };
+                let now = unix_time_ms()?;
+                let lease = CapabilityLease::issue_with_side_effects(
                     identity.principal.clone(),
                     identity.tenant.clone(),
                     "mcp-request".into(),
                     capabilities,
                     CapabilityScope::default(),
-                    self.state.started.elapsed().as_millis() as u64 + ttl_ms,
+                    now.saturating_add(ttl_ms),
                     MoneyBudgetMicros(0),
                     TokenBudget(4_096),
                     RetryBudget(1),
+                    side_effects,
                 );
                 if self.state.leases.put(&lease).is_err() {
                     return Ok(tool_error("GM_STORAGE_WRITE").into());
@@ -800,7 +890,7 @@ impl MeshMcpServer {
                 else {
                     return Ok(tool_error("GM_LEASE_CAPABILITY_OUTSIDE_CONE").into());
                 };
-                let now = self.state.started.elapsed().as_millis() as u64;
+                let now = unix_time_ms()?;
                 let authorization = lease.authorize_invocation(
                     &identity.principal,
                     &identity.tenant,
@@ -812,6 +902,54 @@ impl MeshMcpServer {
                     Ok(()) => self.invoke_tool(tool, tool_arguments.cloned()).await,
                     Err(error) => Ok(tool_error(lease_error_code(error)).into()),
                 }
+            }
+            "gaugemesh_submit" => {
+                if !client_supports_tasks {
+                    return Ok(tool_error("GM_TASK_CLIENT_CAPABILITY_REQUIRED").into());
+                }
+                let Some(task_proxy) = &self.state.task_proxy else {
+                    return Ok(tool_error("GM_TASK_DURABLE_ROUTE_UNAVAILABLE").into());
+                };
+                let lease_id = arguments
+                    .get("leaseId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let alias = arguments.get("alias").and_then(Value::as_str).unwrap_or("");
+                let Some(tool_arguments) = arguments.get("arguments").and_then(Value::as_object)
+                else {
+                    return Ok(tool_error("GM_TASK_ARGUMENTS_REQUIRED").into());
+                };
+                let Some(task) = arguments.get("task") else {
+                    return Ok(tool_error("GM_TASK_SUBMISSION_REQUIRED").into());
+                };
+                let tool = match self.state.federation.tool(alias) {
+                    Ok(tool) => tool,
+                    Err(error) => return Ok(tool_error(error.to_string()).into()),
+                };
+                if !task_proxy.source_supported(&tool.identity.source) {
+                    return Ok(tool_error("GM_TASK_UPSTREAM_UNSUPPORTED").into());
+                }
+                let Some(lease) = self
+                    .state
+                    .leases
+                    .get(lease_id)
+                    .map_err(|_| McpError::internal_error("GM_STORAGE_READ", None))?
+                else {
+                    return Ok(tool_error("GM_LEASE_CAPABILITY_OUTSIDE_CONE").into());
+                };
+                let now = unix_time_ms()?;
+                if let Err(error) = lease.authorize_invocation(
+                    &identity.principal,
+                    &identity.tenant,
+                    &tool.identity,
+                    SideEffectClass::NonIdempotentWrite,
+                    now,
+                ) {
+                    return Ok(tool_error(lease_error_code(error)).into());
+                }
+                task_proxy
+                    .submit(tool, tool_arguments.clone(), task, identity)
+                    .await
             }
             "gaugemesh_release" => {
                 let lease_id = arguments
@@ -841,6 +979,35 @@ impl MeshMcpServer {
 }
 
 impl ServerHandler for MeshMcpServer {
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, McpError> {
+        context.peer.set_peer_info(request.clone());
+        let mut info = self.get_info();
+        if self
+            .supported_protocol_versions()
+            .contains(&request.protocol_version)
+        {
+            info.protocol_version = request.protocol_version;
+        }
+        if info.protocol_version != ProtocolVersion::V_2026_07_28 {
+            let extensions_empty =
+                info.capabilities
+                    .extensions
+                    .as_mut()
+                    .is_some_and(|extensions| {
+                        extensions.remove(TASKS_EXTENSION_ID);
+                        extensions.is_empty()
+                    });
+            if extensions_empty {
+                info.capabilities.extensions = None;
+            }
+        }
+        Ok(info)
+    }
+
     #[allow(deprecated)]
     fn get_info(&self) -> ServerInfo {
         let capabilities = if self.state.conformance_fixture {
@@ -852,11 +1019,15 @@ impl ServerHandler for MeshMcpServer {
                 .enable_prompts()
                 .build()
         } else {
-            ServerCapabilities::builder()
+            let builder = ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
-                .enable_prompts()
-                .build()
+                .enable_prompts();
+            if self.state.task_proxy.is_some() {
+                builder.enable_tasks().build()
+            } else {
+                builder.build()
+            }
         };
         ServerInfo::new(capabilities)
             .with_server_info(Implementation::new("gaugemesh", env!("CARGO_PKG_VERSION")))
@@ -920,14 +1091,20 @@ impl ServerHandler for MeshMcpServer {
     async fn list_tools(
         &self,
         request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
         let mut tools = if self.state.capability_mode == CapabilityMode::Transparent {
             self.state.federation.rmcp_tools()
         } else {
             Vec::new()
         };
-        tools.extend(Self::meta_tools());
+        let expose_task_submission =
+            self.state.task_proxy.is_some() && context_supports_tasks(&context);
+        tools.extend(
+            Self::meta_tools()
+                .into_iter()
+                .filter(|tool| expose_task_submission || tool.name != "gaugemesh_submit"),
+        );
         if self.state.conformance_fixture {
             tools.extend(Self::conformance_tools());
         }
@@ -947,6 +1124,7 @@ impl ServerHandler for MeshMcpServer {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         let identity = identity_from_context(&context);
+        let client_supports_tasks = context_supports_tasks(&context);
         if self.state.conformance_fixture {
             if let Some(response) = self.conformance_mrtr_tool(&request, &context)? {
                 return Ok(response);
@@ -1043,7 +1221,12 @@ impl ServerHandler for MeshMcpServer {
         }
         if request.name.starts_with("gaugemesh_") {
             return self
-                .call_meta_tool(&request.name, request.arguments, &identity)
+                .call_meta_tool(
+                    &request.name,
+                    request.arguments,
+                    &identity,
+                    client_supports_tasks,
+                )
                 .await;
         }
         if self.state.capability_mode == CapabilityMode::Lease {
@@ -1081,6 +1264,60 @@ impl ServerHandler for MeshMcpServer {
             }
         }
         Ok(Self::tool_result(&tool, request.arguments.as_ref()).into())
+    }
+
+    async fn get_task(
+        &self,
+        request: GetTaskParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<GetTaskResult, McpError> {
+        if !context_supports_tasks(&context) {
+            return Err(McpError::method_not_found::<GetTaskMethod>());
+        }
+        let task_proxy = self
+            .state
+            .task_proxy
+            .as_ref()
+            .ok_or_else(McpError::method_not_found::<GetTaskMethod>)?;
+        task_proxy
+            .get_task(request, &identity_from_context(&context))
+            .await
+    }
+
+    async fn update_task(
+        &self,
+        request: UpdateTaskParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        if !context_supports_tasks(&context) {
+            return Err(McpError::method_not_found::<UpdateTaskMethod>());
+        }
+        let task_proxy = self
+            .state
+            .task_proxy
+            .as_ref()
+            .ok_or_else(McpError::method_not_found::<UpdateTaskMethod>)?;
+        task_proxy
+            .update_task(request, &identity_from_context(&context))
+            .await
+    }
+
+    async fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        if !context_supports_tasks(&context) {
+            return Err(McpError::method_not_found::<CancelTaskMethod>());
+        }
+        let task_proxy = self
+            .state
+            .task_proxy
+            .as_ref()
+            .ok_or_else(McpError::method_not_found::<CancelTaskMethod>)?;
+        task_proxy
+            .cancel_task(request, &identity_from_context(&context))
+            .await
     }
 
     async fn list_resources(
@@ -1419,8 +1656,58 @@ fn identity_from_context(context: &RequestContext<RoleServer>) -> AuthenticatedI
         })
 }
 
+fn context_supports_tasks(context: &RequestContext<RoleServer>) -> bool {
+    context
+        .client_capabilities()
+        .is_some_and(|capabilities| capabilities.supports_tasks())
+        && context.protocol_version() == Some(ProtocolVersion::V_2026_07_28)
+}
+
 fn tool_error(message: impl Into<String>) -> CallToolResult {
     CallToolResult::structured_error(json!({"code": message.into()}))
+}
+
+fn unix_time_ms() -> Result<u64, McpError> {
+    let milliseconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| McpError::internal_error("GM_CLOCK_INVALID", None))?
+        .as_millis();
+    u64::try_from(milliseconds).map_err(|_| McpError::internal_error("GM_CLOCK_INVALID", None))
+}
+
+fn explicit_side_effects(value: Option<&Value>) -> Result<BTreeSet<SideEffectClass>, &'static str> {
+    let Some(value) = value else {
+        return Ok(BTreeSet::from([SideEffectClass::ReadOnly]));
+    };
+    let values = value.as_array().ok_or("GM_LEASE_SIDE_EFFECT_INVALID")?;
+    if values.is_empty() || values.len() > 3 {
+        return Err("GM_LEASE_SIDE_EFFECT_INVALID");
+    }
+    let mut effects = BTreeSet::new();
+    for value in values {
+        let effect = match value.as_str() {
+            Some("read_only") => SideEffectClass::ReadOnly,
+            Some("idempotent_write") => SideEffectClass::IdempotentWrite,
+            Some("non_idempotent_write") => SideEffectClass::NonIdempotentWrite,
+            _ => return Err("GM_LEASE_SIDE_EFFECT_INVALID"),
+        };
+        if !effects.insert(effect) {
+            return Err("GM_LEASE_SIDE_EFFECT_INVALID");
+        }
+    }
+    Ok(effects)
+}
+
+fn identity_authorizes_effect(identity: &AuthenticatedIdentity, effect: SideEffectClass) -> bool {
+    if identity.principal == local_principal() && identity.tenant == local_tenant() {
+        return true;
+    }
+    let required_scope = match effect {
+        SideEffectClass::ReadOnly => return true,
+        SideEffectClass::IdempotentWrite => "gaugemesh:effect:idempotent-write",
+        SideEffectClass::NonIdempotentWrite => "gaugemesh:effect:non-idempotent-write",
+    };
+    identity.scopes.iter().any(|scope| scope == required_scope)
 }
 
 fn lease_error_code(error: LeaseError) -> &'static str {
@@ -1524,6 +1811,7 @@ mod tests {
         let tools = client.list_all_tools().await.unwrap();
         assert!(tools.iter().any(|tool| tool.name == "docs-a__search"));
         assert!(tools.iter().any(|tool| tool.name == "docs-b__search"));
+        assert!(!tools.iter().any(|tool| tool.name == "gaugemesh_submit"));
         assert_eq!(client.list_all_resources().await.unwrap().len(), 2);
         assert_eq!(client.list_all_prompts().await.unwrap().len(), 2);
         client.cancel().await.unwrap();
@@ -1538,6 +1826,7 @@ mod tests {
                 Federation::demo(),
                 None,
                 Arc::new(MemoryStorage::default()),
+                None,
                 CapabilityMode::Lease,
             )
             .serve(server_side)
@@ -1550,6 +1839,7 @@ mod tests {
         let client = TestClient.serve(client_side).await.unwrap();
         let tools = client.list_all_tools().await.unwrap();
         assert!(tools.iter().any(|tool| tool.name == "gaugemesh_lease"));
+        assert!(!tools.iter().any(|tool| tool.name == "gaugemesh_submit"));
         assert!(!tools.iter().any(|tool| tool.name == "docs-a__search"));
         let direct = client
             .call_tool_once(CallToolRequestParams::new("docs-a__search"))
@@ -1560,6 +1850,29 @@ mod tests {
                 .to_string()
                 .contains("GM_CAPABILITY_LEASE_REQUIRED")
         );
+
+        for invalid_arguments in [
+            json!({"aliases": vec!["docs-a__search"; 33]}),
+            json!({"aliases":["docs-a__search"],"ttlMs":0}),
+            json!({"aliases":["docs-a__search"],"ttlMs":-1}),
+            json!({"aliases":["docs-a__search"],"ttlMs":1.5}),
+        ] {
+            let response = client
+                .call_tool_once(
+                    CallToolRequestParams::new("gaugemesh_lease")
+                        .with_arguments(invalid_arguments.as_object().unwrap().clone()),
+                )
+                .await
+                .unwrap();
+            let code = match response {
+                CallToolResponse::Complete(result) => result
+                    .structured_content
+                    .and_then(|value| value.get("code").and_then(Value::as_str).map(str::to_owned))
+                    .unwrap(),
+                other => panic!("expected bounded lease refusal, got {other:?}"),
+            };
+            assert_eq!(code, "GM_LEASE_LIMIT_INVALID");
+        }
 
         let lease_response = client
             .call_tool_once(
@@ -1596,5 +1909,37 @@ mod tests {
         assert!(matches!(invocation, CallToolResponse::Complete(_)));
         client.cancel().await.unwrap();
         server.await.unwrap();
+    }
+
+    #[test]
+    fn remote_write_effects_require_explicit_scopes() {
+        let mut identity = AuthenticatedIdentity {
+            principal: PrincipalId("remote-caller".into()),
+            tenant: TenantId("tenant-a".into()),
+            scopes: vec![],
+        };
+        assert!(identity_authorizes_effect(
+            &identity,
+            SideEffectClass::ReadOnly
+        ));
+        assert!(!identity_authorizes_effect(
+            &identity,
+            SideEffectClass::IdempotentWrite
+        ));
+        assert!(!identity_authorizes_effect(
+            &identity,
+            SideEffectClass::NonIdempotentWrite
+        ));
+        identity
+            .scopes
+            .push("gaugemesh:effect:idempotent-write".into());
+        assert!(identity_authorizes_effect(
+            &identity,
+            SideEffectClass::IdempotentWrite
+        ));
+        assert!(!identity_authorizes_effect(
+            &identity,
+            SideEffectClass::NonIdempotentWrite
+        ));
     }
 }
