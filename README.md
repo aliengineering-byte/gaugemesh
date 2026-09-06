@@ -281,7 +281,7 @@ MCP certification, or security certification.
 | MCP server, Streamable HTTP, 2025-11-25 | official conformance 0.2.0-alpha.11 | 70/70 scored checks |
 | MCP server, Streamable HTTP, 2026-07-28 | official conformance 0.2.0-alpha.11 | 117/117 scored checks |
 | MCP client, stdio and HTTP, both revisions | RMCP 3.1.4 cross-process/integration tests | VERIFIED subset |
-| MCP Tasks route, 2026-07-28 | RMCP task lifecycle plus neutral child-process qualification with SQLite restart | VERIFIED bounded subset in current source |
+| MCP Tasks route, 2026-07-28 | RMCP task lifecycle plus neutral child-process qualification with a router-only SQLite reopen that retains the bound upstream session | VERIFIED bounded subset in current source |
 | OpenAI-compatible HTTP | raw HTTP, provider fixture, and OpenAI Python SDK 3.6.0 | VERIFIED subset |
 | Product-specific client installation | not executed | DOCUMENTED_ONLY or UNSUPPORTED |
 
@@ -297,6 +297,23 @@ See the [MCP matrix](docs/compatibility/MCP.md),
 [client levels](docs/compatibility/CLIENTS.md), and
 [conformance inventory](docs/compatibility/CONFORMANCE.md).
 
+Exercise the durable route explicitly from a native binary—no Rust toolchain,
+account, or provider is required:
+
+```sh
+gaugemesh verify --durable-tasks
+```
+
+This embedded qualification self-spawns a synthetic JSON provider over MCP
+stdio; that provider starts the bounded JSON worker as a separate real child
+process. It reopens its temporary SQLite router state and separately reports
+execution and artifact-verification outcomes. It is not a shipped general
+executor. GaugeMesh has no background task scheduler: after an upstream
+acknowledgement, deadline cancellation begins only on a later caller poll; a
+cancel acknowledgement is not observed termination. A changed upstream session
+can leave a nonterminal route reconciliation-only, and `tasks/update` is
+explicitly unsupported for durable routes.
+
 ## ResiliReplay verification
 
 ResiliReplay is optional and external:
@@ -306,12 +323,14 @@ gaugemesh verify --resilireplay
 ```
 
 GaugeMesh invokes the exact published `resilireplay@0.7.0` executable with an
-argument array from sanitized temporary state. Thirteen scenarios produced three
-recovery passes and ten explicit failures; the required clean, timeout, and
-deterministic-error recovery gate passed, cleanup completed, and duplicate
-effects were zero. The honest aggregate is `PARTIAL`. ResiliReplay emitted no
-MCP-RES v0.2 profile/evidence class for this command, so GaugeMesh makes no
-MCP-RES claim. Details and the evidence digest are in
+argument array from sanitized temporary state. One genuine clean control and
+twelve explicit fault rows produced three passes and ten explicit failures.
+The two passing recovery rows are ResiliReplay trace-level synthetic timeout
+and deterministic-error mutations followed by a real bounded retry; 0.7.0 does
+not inject those faults into the MCP wire or server. Cleanup completed and the
+fault runs reported zero duplicate effects. The honest aggregate is `PARTIAL`.
+ResiliReplay emitted no MCP-RES v0.2 profile/evidence class for this command, so
+GaugeMesh makes no MCP-RES claim. Details and the evidence digest are in
 [the verification record](docs/guides/RESILIREPLAY.md).
 
 ## Development

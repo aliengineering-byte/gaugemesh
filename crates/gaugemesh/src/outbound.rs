@@ -39,7 +39,6 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::{Mutex, RwLock};
 
-#[cfg(test)]
 use rmcp::model::UpdateTaskParams;
 
 pub(crate) const TASK_EXECUTION_META_KEY: &str = "dev.gaugemesh/taskExecution";
@@ -1357,38 +1356,47 @@ fn simple_template_variables(template: &str) -> Option<Vec<String>> {
     }
 }
 
-#[cfg(test)]
-mod tests {
+// The neutral durable-Tasks qualification lives beside the private outbound
+// machinery it exercises so the shipped binary and unit test use the same
+// worker, caller, artifact verifier, and real-process path. Ordinary test-only
+// entry points in this module remain marked with `#[test]`.
+pub(crate) mod qualification {
     use super::*;
-    use crate::mcp::{MeshMcpServer, router};
+    use crate::mcp::MeshMcpServer;
+    #[cfg(test)]
+    use crate::mcp::router;
+    #[cfg(test)]
     use gaugemesh_core::{
         context::{PrincipalId, TenantId},
-        digest::canonical_json,
-        storage::{LeaseStorage, SqliteStorage, TaskRouteStorage},
+        storage::{LeaseStorage, TaskRouteStorage},
         task::{
             PublicTaskId, TaskRouteCaller, TaskRouteIdempotencyKey, TaskRoutePhase,
             TaskRouteRecord, TaskRouteUpdate,
         },
     };
+    use gaugemesh_core::{digest::canonical_json, storage::SqliteStorage};
+    #[cfg(test)]
+    use rmcp::model::{ContentBlock, DetailedTask, Task, TaskPayload};
     use rmcp::{
         ServerHandler,
         model::{
-            CallToolResult, ContentBlock, CreateTaskResult, DetailedTask, Implementation,
-            JsonObject, ListToolsResult, MetaObject, ServerCapabilities, ServerInfo, Task,
-            TaskPayload, TaskStatus, Tool, ToolAnnotations,
+            CallToolResult, CreateTaskResult, Implementation, JsonObject, ListToolsResult,
+            MetaObject, ServerCapabilities, ServerInfo, TaskStatus, Tool, ToolAnnotations,
         },
         service::{RequestContext, RoleServer},
-        task_manager::{TaskExit, TaskManager, TaskOptions},
+        task_manager::{TaskContext, TaskExit, TaskManager, TaskOptions},
     };
     use serde::{Deserialize, Serialize};
     use serde_json::json;
+    #[cfg(test)]
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
     use std::{
         fs,
         io::Write as _,
         path::{Component, PathBuf},
-        sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering},
         time::SystemTime,
     };
+    #[cfg(test)]
     use tempfile::TempDir;
 
     const NEUTRAL_WORKER_ENV: &str = "GAUGEMESH_NEUTRAL_WORKER_ENTRY";
@@ -1402,6 +1410,7 @@ mod tests {
     const MAX_NEUTRAL_INPUT_BYTES: usize = 4 * 1024;
     const MAX_NEUTRAL_ARTIFACT_BYTES: usize = 64 * 1024;
 
+    #[cfg(test)]
     #[test]
     fn application_errors_do_not_request_peer_restart() {
         let (_, restart) = classify_upstream_result::<()>(
@@ -1418,6 +1427,7 @@ mod tests {
         assert!(!restart);
     }
 
+    #[cfg(test)]
     #[test]
     fn connection_errors_request_peer_restart() {
         let (_, restart) =
@@ -1425,6 +1435,7 @@ mod tests {
         assert!(restart);
     }
 
+    #[cfg(test)]
     #[test]
     fn discovery_pager_rejects_repeated_cursor_and_page_overflow() {
         let mut pager = DiscoveryPager::default();
@@ -1449,6 +1460,7 @@ mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
     fn discovery_budget_rejects_aggregate_item_and_byte_overflow() {
         let mut item_budget = DiscoveryBudget {
@@ -1498,14 +1510,15 @@ mod tests {
             "properties": {
                 "input": {"type": "object"},
                 "outputDirectory": {"type": "string"},
-                "identities": {"type": "object"}
+                "identities": {"type": "object"},
+                "qualificationDelayMs": {"type": "integer", "minimum": 0, "maximum": 5000}
             },
             "required": ["input", "outputDirectory", "identities"],
             "additionalProperties": false
         });
         Tool::new(
             NEUTRAL_TOOL_NAME,
-            "Test-only bounded JSON normalization worker",
+            "Bounded JSON normalization worker for durable-Tasks qualification",
             Arc::new(schema.as_object().unwrap().clone()),
         )
         .with_annotations(ToolAnnotations::from_raw(
@@ -1538,6 +1551,8 @@ mod tests {
         input: Value,
         output_directory: String,
         identities: NeutralIdentities,
+        #[serde(default)]
+        qualification_delay_ms: u64,
     }
 
     #[derive(Debug, Deserialize, Serialize)]
@@ -1563,8 +1578,13 @@ mod tests {
     struct NeutralTaskFixture {
         tasks: TaskManager,
         permitted_root: Arc<PathBuf>,
+        #[cfg(test)]
         submissions: Arc<AtomicUsize>,
+        #[cfg(test)]
+        cancellations: Arc<AtomicUsize>,
+        #[cfg(test)]
         acknowledgement_delay_ms: Arc<AtomicU64>,
+        #[cfg(test)]
         complete_response: Arc<AtomicBool>,
         task_metadata: Arc<Mutex<BTreeMap<String, MetaObject>>>,
     }
@@ -1574,8 +1594,13 @@ mod tests {
             Self {
                 tasks: TaskManager::new(),
                 permitted_root: Arc::new(permitted_root),
+                #[cfg(test)]
                 submissions: Arc::new(AtomicUsize::new(0)),
+                #[cfg(test)]
+                cancellations: Arc::new(AtomicUsize::new(0)),
+                #[cfg(test)]
                 acknowledgement_delay_ms: Arc::new(AtomicU64::new(0)),
+                #[cfg(test)]
                 complete_response: Arc::new(AtomicBool::new(false)),
                 task_metadata: Arc::new(Mutex::new(BTreeMap::new())),
             }
@@ -1700,12 +1725,14 @@ mod tests {
                     None,
                 ));
             }
+            #[cfg(test)]
             self.submissions.fetch_add(1, AtomicOrdering::SeqCst);
             let mut metadata = JsonObject::new();
             metadata.insert(TASK_EXECUTION_META_KEY.into(), execution_metadata);
             let metadata = MetaObject(metadata);
             let terminal_metadata = metadata.clone();
             let permitted_root = self.permitted_root.as_ref().clone();
+            #[cfg(test)]
             if self.complete_response.load(AtomicOrdering::Acquire) {
                 let worker = run_neutral_worker_process(&permitted_root, &arguments, false)
                     .await
@@ -1733,39 +1760,52 @@ mod tests {
                 TaskOptions::new()
                     .with_ttl_ms(30_000)
                     .with_poll_interval_ms(10)
-                    .with_status_message("test-only neutral worker process"),
+                    .with_status_message("neutral qualification worker process"),
                 move |context| {
                     Box::pin(async move {
-                        let worker = run_neutral_worker_process(&permitted_root, &arguments, false);
-                        tokio::select! {
-                            _ = context.cancelled() => Err(TaskExit::Cancelled),
-                            outcome = worker => {
-                                let output = outcome.map_err(|error| {
-                                    TaskExit::Error(McpError::internal_error(error.to_string(), None))
-                                })?;
-                                if !output.success() {
-                                    return Err(TaskExit::Error(McpError::internal_error(
-                                        "NEUTRAL_WORKER_PROCESS_FAILED",
-                                        None,
-                                    )));
-                                }
-                                Ok(CallToolResult::structured(json!({
-                                    "worker": "test-process",
-                                    "status": "artifacts-written"
-                                })).with_meta(Some(terminal_metadata)))
-                            }
+                        let output = run_neutral_worker_task_process(
+                            &permitted_root,
+                            &arguments,
+                            false,
+                            context,
+                        )
+                        .await?;
+                        if !output.success() {
+                            return Err(TaskExit::Error(McpError::internal_error(
+                                "NEUTRAL_WORKER_PROCESS_FAILED",
+                                None,
+                            )));
                         }
+                        Ok(CallToolResult::structured(json!({
+                            "worker": "qualification-process",
+                            "status": "artifacts-written"
+                        }))
+                        .with_meta(Some(terminal_metadata)))
                     })
                 },
             );
+            record_qualification_event(
+                &self.permitted_root,
+                "upstream-submissions",
+                &task.task_id,
+                json!({
+                    "logicalTaskId": worker_arguments.identities.logical_task_id,
+                    "taskId": task.task_id,
+                    "state": "accepted"
+                }),
+            )
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
             self.task_metadata
                 .lock()
                 .await
                 .insert(task.task_id.clone(), metadata.clone());
-            let acknowledgement_delay_ms =
-                self.acknowledgement_delay_ms.load(AtomicOrdering::Acquire);
-            if acknowledgement_delay_ms > 0 {
-                tokio::time::sleep(Duration::from_millis(acknowledgement_delay_ms)).await;
+            #[cfg(test)]
+            {
+                let acknowledgement_delay_ms =
+                    self.acknowledgement_delay_ms.load(AtomicOrdering::Acquire);
+                if acknowledgement_delay_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(acknowledgement_delay_ms)).await;
+                }
             }
             Ok(CallToolResponse::Task(
                 CreateTaskResult::new(task).with_meta(metadata),
@@ -1801,7 +1841,33 @@ mod tests {
             request: CancelTaskParams,
             _context: RequestContext<RoleServer>,
         ) -> std::result::Result<(), McpError> {
-            self.tasks.cancel_task(&request.task_id)
+            self.tasks.cancel_task(&request.task_id)?;
+            #[cfg(test)]
+            self.cancellations.fetch_add(1, AtomicOrdering::SeqCst);
+            let logical_task_id = self
+                .task_metadata
+                .lock()
+                .await
+                .get(&request.task_id)
+                .and_then(|metadata| metadata.get(TASK_EXECUTION_META_KEY))
+                .and_then(|execution| execution.get("submission"))
+                .and_then(|submission| submission.get("task"))
+                .and_then(|task| task.get("logicalTaskId"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned();
+            record_qualification_event(
+                &self.permitted_root,
+                "cancellation-acknowledgements",
+                &request.task_id,
+                json!({
+                    "logicalTaskId": logical_task_id,
+                    "taskId": request.task_id,
+                    "state": "acknowledged"
+                }),
+            )
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            Ok(())
         }
 
         fn get_info(&self) -> ServerInfo {
@@ -1904,6 +1970,53 @@ mod tests {
         Ok(())
     }
 
+    fn record_qualification_event(
+        root: &Path,
+        class: &str,
+        identity: &str,
+        value: Value,
+    ) -> anyhow::Result<()> {
+        let directory = prepare_output_directory(root, class)?;
+        let name = format!(
+            "event-{}.json",
+            Sha256Digest::of_bytes(identity.as_bytes())
+                .to_string()
+                .trim_start_matches("sha256:")
+        );
+        let bytes = serde_json::to_vec(&canonical_json(&value))?;
+        match write_new(&directory.join(name), &bytes) {
+            Ok(()) => Ok(()),
+            Err(error)
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::AlreadyExists)
+                }) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn count_qualification_events(
+        root: &Path,
+        class: &str,
+        logical_task_id: &str,
+    ) -> anyhow::Result<usize> {
+        let directory = root.join(class);
+        match fs::read_dir(directory) {
+            Ok(entries) => entries
+                .map(|entry| -> anyhow::Result<bool> {
+                    let value: Value = serde_json::from_slice(&fs::read(entry?.path())?)?;
+                    Ok(value.get("logicalTaskId").and_then(Value::as_str) == Some(logical_task_id))
+                })
+                .try_fold(0usize, |count, matches| Ok(count + usize::from(matches?))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     fn write_neutral_worker_artifacts(
         root: &Path,
         arguments: &Value,
@@ -1917,11 +2030,40 @@ mod tests {
         if !arguments.input.is_object() {
             anyhow::bail!("NEUTRAL_INPUT_MUST_BE_OBJECT");
         }
+        if arguments.qualification_delay_ms > 5_000 {
+            anyhow::bail!("NEUTRAL_QUALIFICATION_DELAY_INVALID");
+        }
+        let process_id = std::process::id();
+        record_qualification_event(
+            root,
+            "worker-starts",
+            &format!("{}:{process_id}", arguments.identities.logical_task_id),
+            json!({
+                "logicalTaskId": arguments.identities.logical_task_id,
+                "processId": process_id,
+                "state": "started"
+            }),
+        )?;
+        if arguments.qualification_delay_ms > 0 {
+            std::thread::sleep(Duration::from_millis(arguments.qualification_delay_ms));
+        }
         let output = prepare_output_directory(root, &arguments.output_directory)?;
         let effects = prepare_output_directory(root, "worker-effects")?;
+        let effect = json!({
+            "logicalTaskId": arguments.identities.logical_task_id,
+            "processId": process_id,
+            "state": "effect-committed"
+        });
+        let effect_identity = format!("{}:{process_id}", arguments.identities.logical_task_id);
+        let effect_name = format!(
+            "effect-{}.json",
+            Sha256Digest::of_bytes(effect_identity.as_bytes())
+                .to_string()
+                .trim_start_matches("sha256:")
+        );
         write_new(
-            &effects.join(format!("effect-{}", std::process::id())),
-            b"neutral-worker-effect-v1\n",
+            &effects.join(effect_name),
+            &serde_json::to_vec(&canonical_json(&effect))?,
         )?;
 
         let input_sha256 = Sha256Digest::of_json(&serde_json::to_value(&arguments)?);
@@ -1953,18 +2095,23 @@ mod tests {
         Ok(())
     }
 
-    async fn run_neutral_worker_process(
+    fn neutral_worker_command(
         root: &Path,
         arguments: &Value,
         invalid_output: bool,
-    ) -> anyhow::Result<std::process::ExitStatus> {
+    ) -> anyhow::Result<tokio::process::Command> {
         let executable = std::env::current_exe().context("NEUTRAL_WORKER_EXE_UNAVAILABLE")?;
         let mut command = tokio::process::Command::new(executable);
+        if cfg!(test) {
+            command
+                .arg("--ignored")
+                .arg("--exact")
+                .arg("outbound::qualification::neutral_worker_process_entry")
+                .arg("--nocapture");
+        } else {
+            command.arg("__neutral-worker");
+        }
         command
-            .arg("--ignored")
-            .arg("--exact")
-            .arg("outbound::tests::neutral_worker_process_entry")
-            .arg("--nocapture")
             .env(NEUTRAL_WORKER_ENV, "1")
             .env(NEUTRAL_WORKER_ROOT_ENV, root.as_os_str())
             .env(
@@ -1978,10 +2125,82 @@ mod tests {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true);
+        Ok(command)
+    }
+
+    async fn run_neutral_worker_process(
+        root: &Path,
+        arguments: &Value,
+        invalid_output: bool,
+    ) -> anyhow::Result<std::process::ExitStatus> {
+        let mut command = neutral_worker_command(root, arguments, invalid_output)?;
         tokio::time::timeout(Duration::from_secs(5), command.status())
             .await
             .context("NEUTRAL_WORKER_TIMEOUT")?
             .context("NEUTRAL_WORKER_SPAWN_FAILED")
+    }
+
+    async fn run_neutral_worker_task_process(
+        root: &Path,
+        arguments: &Value,
+        invalid_output: bool,
+        context: TaskContext,
+    ) -> std::result::Result<std::process::ExitStatus, TaskExit> {
+        let worker_arguments: NeutralWorkerArguments = serde_json::from_value(arguments.clone())
+            .map_err(|error| TaskExit::Error(McpError::internal_error(error.to_string(), None)))?;
+        let mut child = neutral_worker_command(root, arguments, invalid_output)
+            .and_then(|mut command| command.spawn().context("NEUTRAL_WORKER_SPAWN_FAILED"))
+            .map_err(|error| TaskExit::Error(McpError::internal_error(error.to_string(), None)))?;
+
+        enum ProcessOutcome {
+            Exited(std::io::Result<std::process::ExitStatus>),
+            Cancelled,
+        }
+        let outcome = tokio::select! {
+            status = child.wait() => ProcessOutcome::Exited(status),
+            _ = context.cancelled() => ProcessOutcome::Cancelled,
+        };
+        match outcome {
+            ProcessOutcome::Exited(status) => status.map_err(|error| {
+                TaskExit::Error(McpError::internal_error(error.to_string(), None))
+            }),
+            ProcessOutcome::Cancelled => {
+                child.start_kill().map_err(|error| {
+                    TaskExit::Error(McpError::internal_error(
+                        format!("NEUTRAL_WORKER_KILL_FAILED:{error}"),
+                        None,
+                    ))
+                })?;
+                let reaped = tokio::time::timeout(Duration::from_secs(2), child.wait())
+                    .await
+                    .map_err(|_| {
+                        TaskExit::Error(McpError::internal_error(
+                            "NEUTRAL_WORKER_REAP_TIMEOUT",
+                            None,
+                        ))
+                    })?
+                    .map_err(|error| {
+                        TaskExit::Error(McpError::internal_error(
+                            format!("NEUTRAL_WORKER_REAP_FAILED:{error}"),
+                            None,
+                        ))
+                    })?;
+                record_qualification_event(
+                    root,
+                    "worker-terminations",
+                    &worker_arguments.identities.logical_task_id,
+                    json!({
+                        "logicalTaskId": worker_arguments.identities.logical_task_id,
+                        "state": "terminated-and-reaped-after-cancellation",
+                        "exitCode": reaped.code()
+                    }),
+                )
+                .map_err(|error| {
+                    TaskExit::Error(McpError::internal_error(error.to_string(), None))
+                })?;
+                Err(TaskExit::Cancelled)
+            }
+        }
     }
 
     fn verify_neutral_artifacts(root: &Path, arguments: &Value) -> anyhow::Result<()> {
@@ -1995,8 +2214,10 @@ mod tests {
         if manifest_bytes.len().saturating_add(result_bytes.len()) > MAX_NEUTRAL_ARTIFACT_BYTES {
             anyhow::bail!("NEUTRAL_VERIFY_ARTIFACT_LIMIT_EXCEEDED");
         }
-        let manifest: NeutralManifest = serde_json::from_slice(&manifest_bytes)?;
-        let result: NeutralResult = serde_json::from_slice(&result_bytes)?;
+        let manifest: NeutralManifest =
+            serde_json::from_slice(&manifest_bytes).context("NEUTRAL_VERIFY_MANIFEST_INVALID")?;
+        let result: NeutralResult =
+            serde_json::from_slice(&result_bytes).context("NEUTRAL_VERIFY_RESULT_INVALID")?;
         let expected_input_sha256 = Sha256Digest::of_json(arguments);
         if manifest.schema_version != NEUTRAL_MANIFEST_SCHEMA
             || result.schema_version != NEUTRAL_RESULT_SCHEMA
@@ -2026,6 +2247,7 @@ mod tests {
             input,
             output_directory: output_directory.into(),
             identities: identities.clone(),
+            qualification_delay_ms: 0,
         })
         .unwrap()
     }
@@ -2071,6 +2293,7 @@ mod tests {
         .clone()
     }
 
+    #[cfg(test)]
     fn task_id(response: CallToolResponse) -> String {
         match response {
             CallToolResponse::Task(created) => created.task.task_id,
@@ -2078,6 +2301,7 @@ mod tests {
         }
     }
 
+    #[cfg(test)]
     fn structured_error_code(response: CallToolResponse) -> Option<String> {
         match response {
             CallToolResponse::Complete(result) => result
@@ -2087,26 +2311,673 @@ mod tests {
         }
     }
 
+    pub(crate) fn run_neutral_worker_from_environment() -> anyhow::Result<()> {
+        if std::env::var_os(NEUTRAL_WORKER_ENV).as_deref() != Some(std::ffi::OsStr::new("1")) {
+            anyhow::bail!("NEUTRAL_WORKER_ENTRY_NOT_AUTHORIZED");
+        }
+        let root = PathBuf::from(
+            std::env::var_os(NEUTRAL_WORKER_ROOT_ENV).context("NEUTRAL_WORKER_ROOT_REQUIRED")?,
+        );
+        let arguments: Value = serde_json::from_str(
+            &std::env::var(NEUTRAL_WORKER_ARGUMENTS_ENV)
+                .context("NEUTRAL_WORKER_ARGUMENTS_REQUIRED")?,
+        )
+        .context("NEUTRAL_WORKER_ARGUMENTS_INVALID")?;
+        let invalid_output = std::env::var(NEUTRAL_WORKER_INVALID_ENV).as_deref() == Ok("1");
+        write_neutral_worker_artifacts(&root, &arguments, invalid_output)
+    }
+
+    pub(crate) async fn serve_neutral_upstream(root: PathBuf) -> anyhow::Result<()> {
+        if !root.is_absolute() {
+            anyhow::bail!("NEUTRAL_UPSTREAM_ROOT_MUST_BE_ABSOLUTE");
+        }
+        let root = root
+            .canonicalize()
+            .context("NEUTRAL_UPSTREAM_ROOT_INVALID")?;
+        let service = NeutralTaskFixture::new(root)
+            .serve(rmcp::transport::stdio())
+            .await
+            .context("NEUTRAL_UPSTREAM_STDIO_START_FAILED")?;
+        service
+            .waiting()
+            .await
+            .context("NEUTRAL_UPSTREAM_STDIO_FAILED")?;
+        Ok(())
+    }
+
+    fn response_task_id(response: CallToolResponse) -> anyhow::Result<String> {
+        match response {
+            CallToolResponse::Task(created) => Ok(created.task.task_id),
+            other => anyhow::bail!("NEUTRAL_QUALIFICATION_EXPECTED_TASK:{other:?}"),
+        }
+    }
+
+    async fn wait_for_terminal_task<H: ClientHandler>(
+        client: &RunningService<RoleClient, H>,
+        public_task_id: &str,
+    ) -> anyhow::Result<GetTaskResult> {
+        for _ in 0..300 {
+            let state = client
+                .peer()
+                .get_task(GetTaskParams::new(public_task_id))
+                .await
+                .context("NEUTRAL_QUALIFICATION_TASK_POLL_FAILED")?;
+            if state.task.status().is_terminal() {
+                return Ok(state);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        anyhow::bail!("NEUTRAL_QUALIFICATION_TASK_NOT_TERMINAL")
+    }
+
+    async fn wait_for_event(
+        root: &Path,
+        class: &str,
+        logical_task_id: &str,
+    ) -> anyhow::Result<usize> {
+        for _ in 0..200 {
+            let count = count_qualification_events(root, class, logical_task_id)?;
+            if count > 0 {
+                return Ok(count);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        anyhow::bail!("NEUTRAL_QUALIFICATION_EVENT_NOT_OBSERVED:{class}")
+    }
+
+    fn require_verifier_rejection(
+        root: &Path,
+        arguments: &Value,
+        expected_code: &str,
+    ) -> anyhow::Result<String> {
+        let error = match verify_neutral_artifacts(root, arguments) {
+            Err(error) => error,
+            Ok(()) => anyhow::bail!("NEUTRAL_QUALIFICATION_INVALID_ARTIFACT_ACCEPTED"),
+        };
+        let chain = format!("{error:#}");
+        if !chain.contains(expected_code) {
+            anyhow::bail!(
+                "NEUTRAL_QUALIFICATION_UNEXPECTED_VERIFIER_ERROR:{expected_code}:{chain}"
+            );
+        }
+        Ok(expected_code.to_owned())
+    }
+
+    fn now_unix_ms() -> anyhow::Result<u64> {
+        SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .context("NEUTRAL_QUALIFICATION_CLOCK_BEFORE_EPOCH")?
+            .as_millis()
+            .try_into()
+            .context("NEUTRAL_QUALIFICATION_CLOCK_OVERFLOW")
+    }
+
+    /// Run the durable-Tasks qualification from the currently executing binary.
+    ///
+    /// The binary self-spawns as a task-capable MCP stdio provider. That provider
+    /// spawns the same binary again as the bounded neutral worker, so an archive
+    /// consumer exercises process, transport, SQLite, and artifact boundaries
+    /// without Cargo, source paths, credentials, or a domain-specific fixture.
+    pub(crate) async fn execute() -> anyhow::Result<()> {
+        let workspace = tempfile::Builder::new()
+            .prefix("gaugemesh-durable-tasks-")
+            .tempdir()
+            .context("NEUTRAL_QUALIFICATION_TEMP_DIRECTORY")?;
+        let permitted_root = workspace.path().join("permitted-output");
+        fs::create_dir(&permitted_root).context("NEUTRAL_QUALIFICATION_OUTPUT_ROOT")?;
+        let executable = std::env::current_exe()
+            .context("NEUTRAL_QUALIFICATION_EXECUTABLE")?
+            .canonicalize()
+            .context("NEUTRAL_QUALIFICATION_EXECUTABLE_CANONICALIZE")?;
+        let upstream_arguments = vec![
+            "__neutral-upstream".to_owned(),
+            "--root".to_owned(),
+            permitted_root.to_string_lossy().into_owned(),
+        ];
+        let discovered = discover_stdio(
+            &executable,
+            &upstream_arguments,
+            std::slice::from_ref(&executable),
+            McpRevision::V2026_07_28,
+            Duration::from_secs(10),
+        )
+        .await
+        .context("NEUTRAL_QUALIFICATION_STDIO_DISCOVERY")?;
+        if !discovered.supports_tasks || discovered.tools != vec![NEUTRAL_TOOL_NAME.to_owned()] {
+            anyhow::bail!("NEUTRAL_QUALIFICATION_UPSTREAM_CAPABILITY_MISMATCH");
+        }
+        let source = McpSourceConfig {
+            id: "neutral-worker".into(),
+            transport: McpTransportConfig::Stdio {
+                command: executable.clone(),
+                args: upstream_arguments,
+            },
+            protocol_revision: McpRevision::V2026_07_28.as_str().into(),
+            capability_snapshot_digest: Some(discovered.capability_manifest_digest),
+            sharing: gaugemesh_core::config::SharingClass::NonShareable,
+            reviewed: true,
+            approval: ApprovalConfig::Deny,
+        };
+        let (federation, upstreams) =
+            connect_configured_sources(&[source], DiscoveryMode::Strict, Duration::from_secs(10))
+                .await
+                .context("NEUTRAL_QUALIFICATION_STDIO_CONNECT")?;
+        let database = workspace.path().join("task-routes.sqlite3");
+
+        let first_storage = Arc::new(
+            SqliteStorage::open(&database).context("NEUTRAL_QUALIFICATION_SQLITE_OPEN_FIRST")?,
+        );
+        let first_mesh = MeshMcpServer::configured(
+            federation.clone(),
+            Some(upstreams.clone()),
+            first_storage.clone(),
+            Some(first_storage.clone()),
+            gaugemesh_core::config::CapabilityMode::Lease,
+        );
+        let (first_server_side, first_client_side) = tokio::io::duplex(64 * 1024);
+        let first_server = tokio::spawn(async move {
+            let service = first_mesh.serve(first_server_side).await?;
+            service.waiting().await?;
+            anyhow::Ok(())
+        });
+        let first_client = neutral_task_client_info()
+            .serve(first_client_side)
+            .await
+            .context("NEUTRAL_QUALIFICATION_CALLER_FIRST")?;
+        let lease_response = first_client
+            .call_tool_once(
+                CallToolRequestParams::new("gaugemesh_lease").with_arguments(
+                    json!({
+                        "aliases": [NEUTRAL_TOOL_ALIAS],
+                        "ttlMs": 60_000,
+                        "sideEffects": ["idempotent_write", "non_idempotent_write"]
+                    })
+                    .as_object()
+                    .expect("static lease object")
+                    .clone(),
+                ),
+            )
+            .await
+            .context("NEUTRAL_QUALIFICATION_LEASE")?;
+        let lease_id = match lease_response {
+            CallToolResponse::Complete(result) => result
+                .structured_content
+                .and_then(|value| {
+                    value
+                        .get("leaseId")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .context("NEUTRAL_QUALIFICATION_LEASE_ID")?,
+            other => anyhow::bail!("NEUTRAL_QUALIFICATION_LEASE_RESPONSE:{other:?}"),
+        };
+        let identities = NeutralIdentities {
+            logical_task_id: "public-qualification-primary".into(),
+            attempt_id: "attempt-primary".into(),
+            correlation_id: "qualification-primary".into(),
+            acceptance_policy_sha256: neutral_acceptance_policy_sha256(),
+            artifact_scope_sha256: neutral_artifact_scope_sha256(),
+            provider_interface_version: neutral_provider_interface_version(),
+        };
+        let arguments = neutral_arguments(
+            "primary",
+            &identities,
+            json!({"z": 3, "a": {"second": 2, "first": 1}}),
+        );
+        let submission = task_submission(
+            &arguments,
+            &identities,
+            "public-qualification-primary-key",
+            now_unix_ms()?.saturating_add(20_000),
+        );
+        let observed_task_id = response_task_id(
+            first_client
+                .call_tool_once(
+                    CallToolRequestParams::new("gaugemesh_submit").with_arguments(
+                        submit_arguments(&lease_id, &arguments, submission.clone()),
+                    ),
+                )
+                .await
+                .context("NEUTRAL_QUALIFICATION_PRIMARY_SUBMIT")?,
+        )?;
+
+        // The harness receives the response so it can later compare identity,
+        // then deliberately discards it as caller state. Only the idempotency
+        // key survives into a newly opened router over the same SQLite file.
+        first_client
+            .cancel()
+            .await
+            .context("NEUTRAL_QUALIFICATION_FIRST_CALLER_CLOSE")?;
+        first_server
+            .await
+            .context("NEUTRAL_QUALIFICATION_FIRST_ROUTER_JOIN")??;
+        drop(first_storage);
+
+        let second_storage = Arc::new(
+            SqliteStorage::open(&database).context("NEUTRAL_QUALIFICATION_SQLITE_REOPEN")?,
+        );
+        let second_mesh = MeshMcpServer::configured(
+            federation,
+            Some(upstreams.clone()),
+            second_storage.clone(),
+            Some(second_storage),
+            gaugemesh_core::config::CapabilityMode::Lease,
+        );
+        let (second_server_side, second_client_side) = tokio::io::duplex(64 * 1024);
+        let second_server = tokio::spawn(async move {
+            let service = second_mesh.serve(second_server_side).await?;
+            service.waiting().await?;
+            anyhow::Ok(())
+        });
+        let second_client = neutral_task_client_info()
+            .serve(second_client_side)
+            .await
+            .context("NEUTRAL_QUALIFICATION_CALLER_SECOND")?;
+        let recovered_task_id = response_task_id(
+            second_client
+                .call_tool_once(
+                    CallToolRequestParams::new("gaugemesh_submit").with_arguments(
+                        submit_arguments(&lease_id, &arguments, submission.clone()),
+                    ),
+                )
+                .await
+                .context("NEUTRAL_QUALIFICATION_PRIMARY_RETRY")?,
+        )?;
+        if recovered_task_id != observed_task_id {
+            anyhow::bail!("NEUTRAL_QUALIFICATION_PUBLIC_TASK_ID_CHANGED");
+        }
+
+        let mut changed_arguments = arguments.clone();
+        changed_arguments["input"] = json!({"a": "changed"});
+        let mut changed_submission = submission.clone();
+        changed_submission["inputSha256"] = json!(Sha256Digest::of_json(&changed_arguments));
+        let changed_error =
+            match second_client
+                .call_tool_once(
+                    CallToolRequestParams::new("gaugemesh_submit").with_arguments(
+                        submit_arguments(&lease_id, &changed_arguments, changed_submission),
+                    ),
+                )
+                .await
+            {
+                Err(error) => error,
+                Ok(_) => anyhow::bail!("NEUTRAL_QUALIFICATION_CHANGED_INPUT_ACCEPTED"),
+            };
+        let changed_error_text = changed_error.to_string();
+        if !changed_error_text.contains("GM_TASK_IDEMPOTENCY_CONFLICT") {
+            anyhow::bail!("NEUTRAL_QUALIFICATION_CHANGED_INPUT:{changed_error_text}");
+        }
+
+        let mut update_input = BTreeMap::new();
+        update_input.insert("answer".into(), json!(42));
+        let update_error = match second_client
+            .peer()
+            .update_task(UpdateTaskParams::new(
+                recovered_task_id.clone(),
+                update_input,
+            ))
+            .await
+        {
+            Err(error) => error,
+            Ok(()) => anyhow::bail!("NEUTRAL_QUALIFICATION_TASK_UPDATE_ACCEPTED"),
+        };
+        let update_error_text = update_error.to_string();
+        if !update_error_text.contains("GM_TASK_UPDATE_UNSUPPORTED_DURABLE") {
+            anyhow::bail!("NEUTRAL_QUALIFICATION_TASK_UPDATE:{update_error_text}");
+        }
+
+        let primary_terminal = wait_for_terminal_task(&second_client, &recovered_task_id).await?;
+        if primary_terminal.task.status() != TaskStatus::Completed {
+            anyhow::bail!("NEUTRAL_QUALIFICATION_PRIMARY_NOT_COMPLETED");
+        }
+        let primary_route = primary_terminal
+            .meta
+            .as_ref()
+            .and_then(|metadata| metadata.get("dev.gaugemesh/taskRoute"))
+            .context("NEUTRAL_QUALIFICATION_PRIMARY_ROUTE_METADATA")?;
+        let primary_execution_state = primary_route
+            .get("executionState")
+            .and_then(Value::as_str)
+            .context("NEUTRAL_QUALIFICATION_PRIMARY_EXECUTION_STATE")?;
+        let primary_policy_acceptance = primary_route
+            .get("policyAcceptance")
+            .and_then(Value::as_str)
+            .context("NEUTRAL_QUALIFICATION_PRIMARY_POLICY_ACCEPTANCE")?;
+        let primary_verification_status = primary_route
+            .get("verificationStatus")
+            .and_then(Value::as_str)
+            .context("NEUTRAL_QUALIFICATION_PRIMARY_VERIFICATION_STATUS")?;
+        if primary_execution_state != "upstream_reported"
+            || primary_policy_acceptance != "not_evaluated_by_gaugemesh"
+            || primary_verification_status != "not_performed"
+        {
+            anyhow::bail!("NEUTRAL_QUALIFICATION_PRIMARY_OUTCOME_BOUNDARY_MISMATCH");
+        }
+        verify_neutral_artifacts(&permitted_root, &arguments)
+            .context("NEUTRAL_QUALIFICATION_PRIMARY_ARTIFACTS")?;
+        let primary_submission_count = count_qualification_events(
+            &permitted_root,
+            "upstream-submissions",
+            &identities.logical_task_id,
+        )?;
+        let primary_worker_start_count = count_qualification_events(
+            &permitted_root,
+            "worker-starts",
+            &identities.logical_task_id,
+        )?;
+        let primary_effect_count = count_qualification_events(
+            &permitted_root,
+            "worker-effects",
+            &identities.logical_task_id,
+        )?;
+        if primary_submission_count != 1
+            || primary_worker_start_count != 1
+            || primary_effect_count != 1
+        {
+            anyhow::bail!(
+                "NEUTRAL_QUALIFICATION_DUPLICATE_EFFECT:{primary_submission_count}:{primary_worker_start_count}:{primary_effect_count}"
+            );
+        }
+
+        let negative_identity = |logical_task_id: &str, attempt_id: &str| NeutralIdentities {
+            logical_task_id: logical_task_id.into(),
+            attempt_id: attempt_id.into(),
+            correlation_id: logical_task_id.into(),
+            ..identities.clone()
+        };
+        let invalid_arguments = neutral_arguments(
+            "invalid-exit-zero",
+            &negative_identity("public-qualification-invalid", "attempt-invalid"),
+            json!({"case": "exit-zero-invalid"}),
+        );
+        let invalid_status =
+            run_neutral_worker_process(&permitted_root, &invalid_arguments, true).await?;
+        if !invalid_status.success() {
+            anyhow::bail!("NEUTRAL_QUALIFICATION_INVALID_WORKER_NOT_EXIT_ZERO");
+        }
+        let invalid_rejection = require_verifier_rejection(
+            &permitted_root,
+            &invalid_arguments,
+            "NEUTRAL_VERIFY_IDENTITY_OR_CONTENT_MISMATCH",
+        )?;
+
+        let missing_arguments = neutral_arguments(
+            "missing",
+            &negative_identity("public-qualification-missing", "attempt-missing"),
+            json!({"case": "missing"}),
+        );
+        let missing_status =
+            run_neutral_worker_process(&permitted_root, &missing_arguments, false).await?;
+        if !missing_status.success() {
+            anyhow::bail!("NEUTRAL_QUALIFICATION_MISSING_SETUP_FAILED");
+        }
+        fs::remove_file(permitted_root.join("missing/manifest.json"))?;
+        let missing_rejection = require_verifier_rejection(
+            &permitted_root,
+            &missing_arguments,
+            "NEUTRAL_VERIFY_ARTIFACT_MISSING",
+        )?;
+
+        let truncated_arguments = neutral_arguments(
+            "truncated",
+            &negative_identity("public-qualification-truncated", "attempt-truncated"),
+            json!({"case": "truncated"}),
+        );
+        let truncated_status =
+            run_neutral_worker_process(&permitted_root, &truncated_arguments, false).await?;
+        if !truncated_status.success() {
+            anyhow::bail!("NEUTRAL_QUALIFICATION_TRUNCATED_SETUP_FAILED");
+        }
+        fs::write(permitted_root.join("truncated/result.json"), b"{")?;
+        let truncated_rejection = require_verifier_rejection(
+            &permitted_root,
+            &truncated_arguments,
+            "NEUTRAL_VERIFY_RESULT_INVALID",
+        )?;
+
+        let swap_a_arguments = neutral_arguments(
+            "swap-a",
+            &negative_identity("public-qualification-swap-a", "attempt-swap-a"),
+            json!({"case": "swap-a"}),
+        );
+        let swap_b_arguments = neutral_arguments(
+            "swap-b",
+            &negative_identity("public-qualification-swap-b", "attempt-swap-b"),
+            json!({"case": "swap-b"}),
+        );
+        let swap_a_status =
+            run_neutral_worker_process(&permitted_root, &swap_a_arguments, false).await?;
+        let swap_b_status =
+            run_neutral_worker_process(&permitted_root, &swap_b_arguments, false).await?;
+        if !swap_a_status.success() || !swap_b_status.success() {
+            anyhow::bail!("NEUTRAL_QUALIFICATION_SWAP_SETUP_FAILED");
+        }
+        fs::copy(
+            permitted_root.join("swap-a/result.json"),
+            permitted_root.join("swap-b/result.json"),
+        )?;
+        let swapped_rejection = require_verifier_rejection(
+            &permitted_root,
+            &swap_b_arguments,
+            "NEUTRAL_VERIFY_IDENTITY_OR_CONTENT_MISMATCH",
+        )?;
+
+        let deadline_identities =
+            negative_identity("public-qualification-deadline", "attempt-deadline");
+        let mut deadline_arguments = neutral_arguments(
+            "deadline-must-not-commit",
+            &deadline_identities,
+            json!({"case": "poll-driven-deadline"}),
+        );
+        deadline_arguments["qualificationDelayMs"] = json!(5_000);
+        let deadline_unix_ms = now_unix_ms()?.saturating_add(2_500);
+        let deadline_submission = task_submission(
+            &deadline_arguments,
+            &deadline_identities,
+            "public-qualification-deadline-key",
+            deadline_unix_ms,
+        );
+        let deadline_task_id = response_task_id(
+            second_client
+                .call_tool_once(
+                    CallToolRequestParams::new("gaugemesh_submit").with_arguments(
+                        submit_arguments(&lease_id, &deadline_arguments, deadline_submission),
+                    ),
+                )
+                .await
+                .context("NEUTRAL_QUALIFICATION_DEADLINE_SUBMIT")?,
+        )?;
+        wait_for_event(
+            &permitted_root,
+            "worker-starts",
+            &deadline_identities.logical_task_id,
+        )
+        .await?;
+        let remaining = deadline_unix_ms.saturating_sub(now_unix_ms()?);
+        tokio::time::sleep(Duration::from_millis(remaining.saturating_add(100))).await;
+        let cancellations_before_poll = count_qualification_events(
+            &permitted_root,
+            "cancellation-acknowledgements",
+            &deadline_identities.logical_task_id,
+        )?;
+        let terminations_before_poll = count_qualification_events(
+            &permitted_root,
+            "worker-terminations",
+            &deadline_identities.logical_task_id,
+        )?;
+        let effects_before_poll = count_qualification_events(
+            &permitted_root,
+            "worker-effects",
+            &deadline_identities.logical_task_id,
+        )?;
+        if cancellations_before_poll != 0
+            || terminations_before_poll != 0
+            || effects_before_poll != 0
+        {
+            anyhow::bail!("NEUTRAL_QUALIFICATION_DEADLINE_WAS_NOT_POLL_DRIVEN");
+        }
+
+        // This first Tasks poll after the deadline is the trigger. No scheduler
+        // is running in the background and no stronger guarantee is inferred.
+        let trigger_state = second_client
+            .peer()
+            .get_task(GetTaskParams::new(deadline_task_id.clone()))
+            .await
+            .context("NEUTRAL_QUALIFICATION_DEADLINE_TRIGGER_POLL")?;
+        let trigger_route_phase = trigger_state
+            .meta
+            .as_ref()
+            .and_then(|metadata| metadata.get("dev.gaugemesh/taskRoute"))
+            .and_then(|route| route.get("routePhase"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .context("NEUTRAL_QUALIFICATION_DEADLINE_ROUTE_PHASE")?;
+        let trigger_status_message = trigger_state.task.task.status_message.as_deref();
+        if trigger_state.task.status() != TaskStatus::Working
+            || trigger_route_phase != "cancel_requested"
+            || trigger_status_message != Some("GM_TASK_RUNTIME_BOUND_REACHED")
+        {
+            anyhow::bail!("NEUTRAL_QUALIFICATION_CANCELLATION_INTENT_NOT_PERSISTED");
+        }
+        let cancellation_acknowledgements = wait_for_event(
+            &permitted_root,
+            "cancellation-acknowledgements",
+            &deadline_identities.logical_task_id,
+        )
+        .await?;
+        let worker_terminations = wait_for_event(
+            &permitted_root,
+            "worker-terminations",
+            &deadline_identities.logical_task_id,
+        )
+        .await?;
+        let deadline_terminal = wait_for_terminal_task(&second_client, &deadline_task_id).await?;
+        if deadline_terminal.task.status() != TaskStatus::Cancelled {
+            anyhow::bail!("NEUTRAL_QUALIFICATION_DEADLINE_NOT_CANCELLED");
+        }
+        let deadline_effects = count_qualification_events(
+            &permitted_root,
+            "worker-effects",
+            &deadline_identities.logical_task_id,
+        )?;
+        if deadline_effects != 0 {
+            anyhow::bail!("NEUTRAL_QUALIFICATION_DEADLINE_EFFECT_COMMITTED");
+        }
+
+        let evidence = json!({
+            "schemaVersion": "gaugemesh.durable-tasks-qualification/1",
+            "status": "PASS",
+            "execution": {
+                "upstreamMcpTransport": "stdio",
+                "callerRouterHarnessTransport": "in-process-duplex",
+                "selfSpawnedUpstreamBinary": true,
+                "selfSpawnedWorkerBinary": true,
+                "sqliteRouterReopened": true,
+                "callerDiscardedAcknowledgement": true,
+                "ownedTemporaryWorkspaceRemoved": true,
+                "publicTaskIdentityPreserved": recovered_task_id == observed_task_id,
+                "upstreamSubmissions": primary_submission_count,
+                "workerProcessStarts": primary_worker_start_count,
+                "workerEffects": primary_effect_count,
+                "duplicateEffects": primary_effect_count.saturating_sub(1),
+                "primaryTerminalStatus": "completed",
+                "primaryBrokerOutcome": {
+                    "executionState": primary_execution_state,
+                    "policyAcceptance": primary_policy_acceptance,
+                    "verificationStatus": primary_verification_status
+                },
+                "changedInput": {
+                    "accepted": false,
+                    "code": "GM_TASK_IDEMPOTENCY_CONFLICT"
+                },
+                "tasksUpdate": {
+                    "forwarded": false,
+                    "code": "GM_TASK_UPDATE_UNSUPPORTED_DURABLE"
+                }
+            },
+            "artifactVerification": {
+                "validArtifacts": "VERIFIED",
+                "exitZeroInvalid": {
+                    "processExitSuccess": invalid_status.success(),
+                    "accepted": false,
+                    "code": invalid_rejection
+                },
+                "missing": {
+                    "fixtureProcessExitSuccess": missing_status.success(),
+                    "postExecutionMutation": "manifest-removed",
+                    "accepted": false,
+                    "code": missing_rejection
+                },
+                "truncated": {
+                    "fixtureProcessExitSuccess": truncated_status.success(),
+                    "postExecutionMutation": "result-truncated",
+                    "accepted": false,
+                    "code": truncated_rejection
+                },
+                "swapped": {
+                    "fixtureProcessExitSuccess": swap_a_status.success() && swap_b_status.success(),
+                    "postExecutionMutation": "result-swapped",
+                    "accepted": false,
+                    "code": swapped_rejection
+                }
+            },
+            "cancellation": {
+                "deadlineEnforcement": "poll-driven",
+                "backgroundScheduler": false,
+                "pollsBetweenSubmissionAndDeadline": 0,
+                "acknowledgementsBeforePoll": cancellations_before_poll,
+                "terminationsBeforePoll": terminations_before_poll,
+                "effectsBeforePoll": effects_before_poll,
+                "triggerPollStatus": "working",
+                "triggerPollStatusMessage": "GM_TASK_RUNTIME_BOUND_REACHED",
+                "persistedIntentAfterTriggerPoll": trigger_route_phase,
+                "acknowledgementsAfterPoll": cancellation_acknowledgements,
+                "workerTerminationsAfterPoll": worker_terminations,
+                "terminalStatus": "cancelled",
+                "effectsAfterTermination": deadline_effects
+            },
+            "guaranteeBoundary": {
+                "exactlyOnceClaimed": false,
+                "durableTaskUpdateSupported": false
+            }
+        });
+        let evidence_sha256 = Sha256Digest::of_json(&evidence);
+        let output = json!({
+            "schemaVersion": "gaugemesh.durable-tasks-qualification-result/1",
+            "status": "PASS",
+            "evidence": evidence,
+            "evidenceSha256": evidence_sha256
+        });
+
+        second_client
+            .cancel()
+            .await
+            .context("NEUTRAL_QUALIFICATION_SECOND_CALLER_CLOSE")?;
+        second_server
+            .await
+            .context("NEUTRAL_QUALIFICATION_SECOND_ROUTER_JOIN")??;
+        upstreams
+            .shutdown()
+            .await
+            .context("NEUTRAL_QUALIFICATION_UPSTREAM_CLOSE")?;
+        workspace
+            .close()
+            .context("NEUTRAL_QUALIFICATION_TEMP_CLEANUP")?;
+        println!("{}", serde_json::to_string_pretty(&output)?);
+        Ok(())
+    }
+
+    #[cfg(test)]
     #[test]
     #[ignore = "helper process entry; invoked by the neutral qualification test"]
     fn neutral_worker_process_entry() {
         if std::env::var_os(NEUTRAL_WORKER_ENV).as_deref() != Some(std::ffi::OsStr::new("1")) {
             return;
         }
-        let root = PathBuf::from(
-            std::env::var_os(NEUTRAL_WORKER_ROOT_ENV)
-                .expect("worker root must be supplied by the harness"),
-        );
-        let arguments: Value = serde_json::from_str(
-            &std::env::var(NEUTRAL_WORKER_ARGUMENTS_ENV)
-                .expect("worker arguments must be supplied by the harness"),
-        )
-        .expect("worker arguments must be JSON");
-        let invalid_output = std::env::var(NEUTRAL_WORKER_INVALID_ENV).as_deref() == Ok("1");
-        write_neutral_worker_artifacts(&root, &arguments, invalid_output)
-            .expect("bounded neutral worker must succeed");
+        run_neutral_worker_from_environment().expect("bounded neutral worker must succeed");
     }
 
+    #[cfg(test)]
     #[test]
     fn neutral_verifier_rejects_missing_truncated_and_swapped_artifacts() {
         let workspace = TempDir::new().unwrap();
@@ -2177,14 +3048,17 @@ mod tests {
         );
     }
 
+    #[cfg(test)]
     #[derive(Clone, Default)]
     struct TaskFixture {
         call_capabilities: Arc<Mutex<Vec<(bool, bool)>>>,
+        gets: Arc<Mutex<Vec<String>>>,
         updates: Arc<Mutex<Vec<String>>>,
         cancellations: Arc<Mutex<Vec<String>>>,
         force_task_response: Arc<AtomicBool>,
     }
 
+    #[cfg(test)]
     impl ServerHandler for TaskFixture {
         async fn call_tool(
             &self,
@@ -2216,6 +3090,7 @@ mod tests {
             request: GetTaskParams,
             _context: RequestContext<RoleServer>,
         ) -> std::result::Result<GetTaskResult, McpError> {
+            self.gets.lock().await.push(request.task_id.clone());
             Ok(GetTaskResult::new(DetailedTask::new(
                 Task::new(
                     request.task_id,
@@ -2255,6 +3130,7 @@ mod tests {
         }
     }
 
+    #[cfg(test)]
     #[test]
     fn gateway_advertises_tasks_only_for_the_extension_revision() {
         let legacy = client_info(McpRevision::V2025_11_25, ApprovalConfig::Deny).get_info();
@@ -2266,6 +3142,7 @@ mod tests {
         assert!(current.capabilities.elicitation.is_some());
     }
 
+    #[cfg(test)]
     #[tokio::test]
     async fn task_capability_and_lifecycle_are_forwarded_without_broker_state() {
         let fixture = TaskFixture::default();
@@ -2380,18 +3257,62 @@ mod tests {
             fixture.call_capabilities.lock().await.as_slice(),
             &[(false, true), (false, true), (true, true)]
         );
+        assert_eq!(fixture.gets.lock().await.as_slice(), &[task_id.clone()]);
         assert_eq!(fixture.updates.lock().await.as_slice(), &[task_id.clone()]);
-        let cancellations = fixture.cancellations.lock().await;
+        let cancellation_count = fixture.cancellations.lock().await.len();
         assert_eq!(
-            cancellations.len(),
+            cancellation_count,
             if response_reached_gaugemesh { 2 } else { 1 }
         );
-        assert!(cancellations.iter().all(|cancelled| cancelled == &task_id));
+        assert!(
+            fixture
+                .cancellations
+                .lock()
+                .await
+                .iter()
+                .all(|cancelled| cancelled == &task_id)
+        );
+
+        let stale_session = runtime.source_session_id(&source_id).await.unwrap();
+        let gets_before = fixture.gets.lock().await.len();
+        let cancellations_before = fixture.cancellations.lock().await.len();
+        runtime
+            .sources
+            .get(&source_id.0)
+            .unwrap()
+            .peer
+            .write()
+            .await
+            .session_id = "gmus_reconnected_fixture".into();
+        let stale_get = runtime
+            .get_task_for_session(
+                &source_id,
+                GetTaskParams::new("private-task-id-must-not-forward"),
+                &stale_session,
+            )
+            .await
+            .unwrap_err();
+        let stale_cancel = runtime
+            .cancel_task_for_session(
+                &source_id,
+                CancelTaskParams::new("private-task-id-must-not-forward"),
+                &stale_session,
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{stale_get:#}").contains("GM_MCP_UPSTREAM_SESSION_CHANGED"));
+        assert!(format!("{stale_cancel:#}").contains("GM_MCP_UPSTREAM_SESSION_CHANGED"));
+        assert_eq!(fixture.gets.lock().await.len(), gets_before);
+        assert_eq!(
+            fixture.cancellations.lock().await.len(),
+            cancellations_before
+        );
 
         runtime.shutdown().await.unwrap();
         server.abort();
     }
 
+    #[cfg(test)]
     #[test]
     fn task_payload_bounds_are_enforced() {
         let oversized_task = GetTaskResult::new(DetailedTask::new(
@@ -2422,6 +3343,7 @@ mod tests {
         );
     }
 
+    #[cfg(test)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn neutral_process_task_survives_lost_ack_and_router_restart_without_duplicate_effects() {
         let workspace = TempDir::new().unwrap();
@@ -3123,6 +4045,7 @@ mod tests {
         upstream_server.abort();
     }
 
+    #[cfg(test)]
     #[tokio::test]
     async fn http_client_discovers_tools_resources_and_prompts() {
         let cancellation = tokio_util::sync::CancellationToken::new();
@@ -3156,6 +4079,7 @@ mod tests {
         server.await.unwrap().unwrap();
     }
 
+    #[cfg(test)]
     #[tokio::test]
     async fn configured_runtime_forwards_tools_resources_and_prompts() {
         let upstream_cancellation = tokio_util::sync::CancellationToken::new();
@@ -3291,6 +4215,7 @@ mod tests {
         upstream_server.await.unwrap().unwrap();
     }
 
+    #[cfg(test)]
     #[tokio::test]
     async fn transport_crashes_restart_for_future_requests_only_and_exhaust_the_budget() {
         let cancellation = tokio_util::sync::CancellationToken::new();
@@ -3358,6 +4283,24 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(format!("{stale_session_error:#}").contains("GM_MCP_UPSTREAM_SESSION_CHANGED"));
+            let stale_get_error = upstreams
+                .get_task_for_session(
+                    &source_id,
+                    GetTaskParams::new("stale-private-task-id"),
+                    &initial_session,
+                )
+                .await
+                .unwrap_err();
+            let stale_cancel_error = upstreams
+                .cancel_task_for_session(
+                    &source_id,
+                    CancelTaskParams::new("stale-private-task-id"),
+                    &initial_session,
+                )
+                .await
+                .unwrap_err();
+            assert!(format!("{stale_get_error:#}").contains("GM_MCP_UPSTREAM_SESSION_CHANGED"));
+            assert!(format!("{stale_cancel_error:#}").contains("GM_MCP_UPSTREAM_SESSION_CHANGED"));
         }
 
         managed
@@ -3381,6 +4324,7 @@ mod tests {
         server.await.unwrap().unwrap();
     }
 
+    #[cfg(test)]
     #[test]
     fn deprecated_sampling_is_never_silently_dropped() {
         assert_eq!(
@@ -3396,6 +4340,7 @@ mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
     fn shell_like_arguments_remain_literal_process_arguments() {
         let executable = std::env::current_exe().unwrap();

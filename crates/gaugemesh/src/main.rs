@@ -105,8 +105,11 @@ enum Command {
     },
     /// Run bounded reliability verification.
     Verify {
-        #[arg(long)]
+        #[arg(long, conflicts_with = "durable_tasks")]
         resilireplay: bool,
+        /// Exercise durable Tasks through this packaged binary and its neutral worker.
+        #[arg(long, conflicts_with = "resilireplay")]
+        durable_tasks: bool,
     },
     /// Print tested client connection configuration.
     Connect {
@@ -121,6 +124,13 @@ enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    #[command(name = "__neutral-upstream", hide = true)]
+    NeutralUpstream {
+        #[arg(long)]
+        root: PathBuf,
+    },
+    #[command(name = "__neutral-worker", hide = true)]
+    NeutralWorker,
 }
 
 #[derive(Debug, Subcommand)]
@@ -233,11 +243,24 @@ async fn main() -> Result<()> {
             admin_address,
         } => serve(config.as_deref(), data_address, admin_address).await,
         Command::McpStdio { config } => serve_stdio(config.as_deref()).await,
+        Command::NeutralUpstream { root } => {
+            outbound::qualification::serve_neutral_upstream(root).await
+        }
+        Command::NeutralWorker => outbound::qualification::run_neutral_worker_from_environment(),
         Command::Add { kind } => add(kind).await,
         Command::Remove { id, config } => remove(&config, &id),
         Command::List { config } => list(&config),
         Command::Registry { command } => registry::execute(command).await,
-        Command::Verify { resilireplay } => verify::execute(resilireplay).await,
+        Command::Verify {
+            resilireplay,
+            durable_tasks,
+        } => {
+            if durable_tasks {
+                outbound::qualification::execute().await
+            } else {
+                verify::execute(resilireplay).await
+            }
+        }
         Command::Connect { client, base_url } => connect(&client, &base_url),
     }
 }

@@ -9,20 +9,22 @@ This route is for an MCP caller that needs to submit one bounded operation,
 survive a lost response or local coordinator restart, and recover the same
 logical task without silently issuing a second upstream operation.
 
-From a source checkout with Rust 1.88 or newer, run the domain-neutral path:
+Run the domain-neutral path directly from a native GaugeMesh binary:
 
 ```console
-cargo test --locked -p gaugemesh outbound::tests::neutral_process_task_survives_lost_ack_and_router_restart_without_duplicate_effects -- --exact --nocapture
+gaugemesh verify --durable-tasks
 ```
 
-The named test reports one pass and the Cargo command exits zero. The test
-starts a real local worker process, reopens SQLite, and independently checks its temporary result and
-manifest. It also expects explicit refusals for changed-input key reuse,
-unsupported schema/provider versions, missing capability/lease authority,
-effect mismatch, traversal/symlink output paths, and an exit-zero worker with
-invalid output. A failure is a nonzero Cargo exit; it is not converted into a
-green report. The worker and artifacts are synthetic test fixtures, not a
-production executor.
+The command exits zero only after its structured result reports `PASS`. It
+self-spawns the embedded qualification provider over MCP stdio; that provider
+starts the bounded JSON worker as a separate real child process. It reopens
+SQLite while retaining the exact upstream session and independently checks the
+temporary result and manifest. It also checks changed-input key reuse,
+exit-zero invalid output, missing, truncated, and swapped artifacts, unsupported
+task updates, and poll-driven deadline cancellation. Ambiguous-dispatch and
+session-drift handling remain separate source-level tests; this public command
+does not simulate a provider-session change. The provider, worker, and artifacts
+are synthetic qualification fixtures, not a production executor.
 
 The caller obtains a lease containing the selected capability's descriptive
 effect plus the conservative task ceiling, submits through `gaugemesh_submit`,
@@ -113,7 +115,7 @@ unsent update from a lost acknowledgement.
 | `dispatching` | Dispatch ownership was persisted for one coordinator instance; a different instance treats it as ambiguous after restart. |
 | `routed` | One upstream task ID is bound write-once to the route. |
 | `cancel_requested` | Cancellation intent was persisted before the upstream cancel request. |
-| `reconciliation_required` | Execution outcome is unknown; poll when an upstream ID is known, but never resubmit automatically. |
+| `reconciliation_required` | Execution outcome is unknown; poll only when an upstream ID is known and its exact bound session is still current, but never resubmit automatically. |
 | `terminal` | A bounded provider result or explicit broker rejection is cached durably. |
 
 Each route is also integrity-bound to the exact upstream runtime connection
@@ -130,9 +132,10 @@ client-capability metadata, including Tasks for this path. The provider must
 echo the exact public ID, request digest, and submission binding.
 A different task ID, missing echo, source/configuration drift, timeout,
 transport error, or unexpected response enters reconciliation instead of being
-reported as success. A known upstream ID can be polled after restart; an
-unknown upstream ID stays explicitly unknown. No ambiguous request is
-automatically submitted again.
+reported as success. A known upstream ID can be polled after a router-only
+reopen only while the exact bound upstream session remains current. A changed
+session is reconciliation-only and an unknown upstream ID stays explicitly
+unknown. No ambiguous request is automatically submitted again.
 
 Cancellation is also conservative. Intent is durable before forwarding. A
 failed or ambiguous cancel remains `cancel_requested` and is reported as
@@ -174,12 +177,13 @@ they do not make an upstream worker safe or an operation transactional.
 
 ## Neutral qualification
 
-The task qualification is domain-independent and test-only. A real child
-process validates and canonically normalizes a small JSON object, writes a
-deterministic result and manifest below a temporary permitted output root, and
-is checked by a separate verifier. The qualification covers:
+The task qualification is domain-independent and embedded in the native binary
+only for explicit verification. A real child process validates and canonically
+normalizes a small JSON object, writes a deterministic result and manifest
+below a temporary permitted output root, and is checked by a separate verifier.
+The qualification covers:
 
-- a simulated lost acknowledgement, SQLite router restart, reconciliation by
+- a caller-discarded acknowledgement, SQLite router restart, reconciliation by
   the same idempotency key and public ID while retaining the live upstream
   session, and one observed worker effect;
 - changed-input idempotency conflict plus schema, lease, capability, and effect
@@ -190,9 +194,10 @@ is checked by a separate verifier. The qualification covers:
   bound identity in its output.
 
 This proves the tested infrastructure behavior for a harmless fixture. The
-worker is not a shipped execution service, and the test is not evidence of
-general hostile-process containment, a production-duration scheduler, or an
-independently verified outcome from arbitrary providers.
+embedded worker is qualification support, not a supported execution service,
+and the result is not evidence of general hostile-process containment, a
+production-duration scheduler, or an independently verified outcome from
+arbitrary providers.
 
 ## Deliberate non-claims
 

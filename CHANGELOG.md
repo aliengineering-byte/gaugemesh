@@ -19,6 +19,12 @@ All notable changes are documented here.
 - Interpret the existing lease-expiry field as an absolute Unix-millisecond
   deadline so SQLite leases remain safe across restart; legacy monotonic-time
   manifests fail closed and must be reissued.
+- Expose the existing neutral durable-Tasks qualification through the native
+  binary and packaged-archive smoke path, including real subprocess/stdio,
+  SQLite reopen, artifact rejection, and poll-driven deadline evidence.
+- Correct the ResiliReplay matrix so one real clean trace plus twelve explicit
+  fault runs form the 13 rows; document that 0.7.0 fault mutation occurs in its
+  recorded trace rather than on the MCP wire.
 
 ## 0.2.2 - 2026-09-03
 
