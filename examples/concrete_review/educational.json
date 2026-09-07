@@ -1,0 +1,22 @@
+{
+  "schemaVersion": "gaugemesh.concrete-review-request/1",
+  "mode": "MECHANICS_ONLY",
+  "profile": {
+    "purpose": "EDUCATIONAL_NO_JURISDICTION", "jurisdiction": null, "governingCode": null,
+    "amendments": [], "referencedStandards": [], "errataSnapshot": "NOT_APPLICABLE_NO_NORMATIVE_RULES",
+    "unitSystem": "SI", "designScope": "RECTANGULAR_BEAM_UNIAXIAL_FLEXURE",
+    "confirmationSource": "Original synthetic algebraic fixture; not a real project or owner approval."
+  },
+  "scope": {"member": "beam", "section": "rectangular", "prestressed": false,
+    "axialForce": {"value": "0", "unit": "N"}, "torsion": {"value": "0", "unit": "N*mm"}, "compressionFace": "top"},
+  "geometry": {"width": {"value": "300", "unit": "mm"}, "height": {"value": "800", "unit": "mm"}},
+  "reinforcement": [{"area": {"value": "1500", "unit": "mm2"}, "depthFromCompressionFace": {"value": "600", "unit": "mm"},
+    "elasticModulus": {"value": "200000", "unit": "MPa"}, "yieldStress": {"value": "500", "unit": "MPa"}}],
+  "concrete": {"elasticModulus": {"value": "20000", "unit": "MPa"}, "topCompressionStrain": {"value": "0.001", "unit": "1"}},
+  "model": {"id": "original-linear-compression-bilinear-steel/1", "approval": "EXPLICIT_REQUEST",
+    "acceptedAssumptions": ["plane_sections", "concrete_tension_ignored", "linear_concrete_compression", "elastic_perfectly_plastic_steel", "steel_displacement_ignored", "prescribed_top_strain_not_code_limit"]},
+  "demand": {"moment": {"value": "250", "unit": "kN*m"}, "basis": "FACTORED"},
+  "solver": {"forceTolerance": {"value": "0.001", "unit": "N"}, "depthTolerance": {"value": "0.000000001", "unit": "mm"},
+    "maxIterations": 128, "independentRelativeTolerance": "0.000000001", "displayDecimals": 3},
+  "rules": {"standard": null, "syntheticPolicy": {"id": "SYNTHETIC_MODEL_DEMAND_MARGIN/1", "maximumRatio": "0.9"}}
+}

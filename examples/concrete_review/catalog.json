@@ -1,0 +1,20 @@
+{
+  "schemaVersion": "gaugemesh.concrete-catalog/1",
+  "observedAt": "2026-09-07",
+  "status": "CATALOG_ONLY",
+  "normativeContentRetrieved": false,
+  "implementedStandardRules": [],
+  "adoptionVerified": false,
+  "entries": [
+    {"id": "ACI CODE-318-25", "role": "structural concrete", "publicationYear": 2025, "unitEditions": ["IN-LB", "SI"], "source": "https://www.concrete.org/store/productdetail.aspx?ItemID=318U25", "errataIndex": "https://www.concrete.org/publications/documenterrata.aspx", "errataContentStatus": "NOT_RETRIEVED_NOT_APPLIED"},
+    {"id": "ACI SPEC-301-20", "role": "construction specifications", "publicationYear": 2020, "unitEditions": ["IN-LB", "SI"], "source": "https://www.concrete.org/store/productdetail.aspx?ItemID=301U20", "errataIndex": "https://www.concrete.org/publications/documenterrata.aspx", "errataContentStatus": "NOT_RETRIEVED_NOT_APPLIED"},
+    {"id": "ACI SPEC-117-10", "role": "construction and material tolerances", "publicationYear": 2010, "reapproved": 2015, "unitEditions": ["IN-LB", "SI"], "source": "https://www.concrete.org/store/productdetail.aspx?ItemID=117U10", "errataIndex": "https://www.concrete.org/publications/documenterrata.aspx", "errataContentStatus": "NOT_RETRIEVED_NOT_APPLIED"},
+    {"id": "ACI CODE-562-25", "role": "existing-structure assessment and repair", "publicationYear": 2025, "unitEditions": ["IN-LB", "SI"], "source": "https://www.concrete.org/store/productdetail.aspx?ItemID=56225", "errataIndex": "https://www.concrete.org/publications/documenterrata.aspx", "errataContentStatus": "NOT_RETRIEVED_NOT_APPLIED"},
+    {"id": "ASCE/SEI 7-22", "role": "loads context, not concrete resistance", "publicationYear": 2022, "source": "https://www.asce.org/publications-and-news/asce-7", "supplementsListed": [1, 2, 3], "errataListed": true, "errataContentStatus": "NOT_RETRIEVED_NOT_APPLIED", "applicableSupplements": "NOT_ASSESSED"}
+  ],
+  "rights": [
+    {"publisher": "ACI", "reading": "NOT_ESTABLISHED_FOR_NORMATIVE_CONTENT", "automatedProcessing": "NOT_AUTHORIZED", "aiUse": "NOT_AUTHORIZED", "derivedImplementation": "NOT_AUTHORIZED", "redistribution": "NOT_AUTHORIZED", "modelProviderTransmission": "NOT_AUTHORIZED", "policy": "https://www.concrete.org/newsandevents/news/newsdetail.aspx?f=51751802", "permissionRequirement": "Written exception from ACI Executive Vice President explicitly covering each proposed use; possession or purchase alone is insufficient."},
+    {"publisher": "ASCE", "reading": "NOT_ESTABLISHED_FOR_NORMATIVE_CONTENT", "automatedProcessing": "NOT_AUTHORIZED", "aiUse": "NOT_AUTHORIZED", "derivedImplementation": "NOT_AUTHORIZED", "redistribution": "NOT_AUTHORIZED", "modelProviderTransmission": "NOT_AUTHORIZED", "policy": "https://www.asce.org/about-asce/terms-conditions/", "permissionRequirement": "Express written permission covering each proposed use and exact content; publication metadata grants no implementation or redistribution right."}
+  ],
+  "olderEditions": "Not silently selected or inferred; require an explicit project requirement, official identity verification and separate rights review."
+}

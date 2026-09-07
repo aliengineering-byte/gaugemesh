@@ -74,6 +74,10 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features
       - run: cargo test --doc --workspace
+      - name: Test optional original mechanics and refusal verification
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python -m unittest discover -s examples/concrete_review -p 'test_*.py' -v
       - run: cargo test --locked -p gaugemesh-core config::tests::checked_in_schema_matches_the_typed_configuration
       - run: cargo run --locked -- demo
       - run: cargo run --locked -- route explain
@@ -101,6 +105,7 @@ jobs:
           python examples/public_tasks/consumer.py --binary "$binary" --output "$RUNNER_TEMP/external-tasks" --require-late-recovery
           python examples/public_tasks/run_consumer.py --binary "$binary" --output "$RUNNER_TEMP/external-runs"
           node examples/public_tasks/second_consumer.mjs "$binary" "$RUNNER_TEMP/external-javascript"
+          python examples/concrete_review/qualify.py --binary "$binary" --output "$RUNNER_TEMP/external-concrete"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:

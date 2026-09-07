@@ -22,6 +22,14 @@ caller-authored plans over the existing Tasks, verified file outcomes, explicit
 resume/cancel, and offline evidence verification. See that contract for the
 local Unix boundary and the external installed-binary qualification commands.
 
+Two explicit first-use paths are available from release source:
+
+- A [neutral recoverable Run](docs/durable-runs.md#external-qualification), with
+  observable worker effects, restart/refusal cases and offline verification.
+- An [optional educational section-mechanics review](examples/concrete_review/README.md),
+  using the same public interface. Its original formulas stay outside the binary;
+  standards catalog metadata is not an authorized rule implementation or approval.
+
 ## Run the local proof
 
 From a release archive:
