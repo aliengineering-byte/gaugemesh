@@ -4,7 +4,7 @@ exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -35,6 +35,7 @@ rand = "=0.9.4"
 reqwest = { version = "=0.13.2", default-features = false, features = ["json", "rustls", "stream"] }
 rmcp = { version = "=3.1.4", default-features = false, features = ["client", "elicitation", "server", "transport-child-process", "transport-io", "transport-streamable-http-client-reqwest", "transport-streamable-http-server"] }
 rusqlite = { version = "=0.37.0", features = ["bundled"] }
+rustix = { version = "=1.1.4", features = ["fs"] }
 schemars = { version = "=1.0.4", features = ["derive", "url2", "uuid1"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"

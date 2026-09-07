@@ -227,7 +227,9 @@ fn validate_identity(principal: &str, tenant: &str) -> Result<(), AuthError> {
                 .chars()
                 .all(|character| !character.is_control() && !character.is_whitespace())
     };
-    if !valid(principal) || !valid(tenant) {
+    // This tuple is reserved for the trusted local transport. A signed remote token
+    // must not acquire local-mode permission exemptions by choosing its subject.
+    if !valid(principal) || !valid(tenant) || (principal == "local-demo" && tenant == "local") {
         return Err(AuthError::TokenSignature);
     }
     Ok(())
@@ -380,7 +382,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let claims = OidcClaims {
+        let mut claims = OidcClaims {
             sub: "alice".into(),
             iss: "https://issuer.example/".into(),
             aud: Audience::One("mesh".into()),
@@ -416,11 +418,28 @@ mod tests {
             "203.0.113.9".parse().unwrap(),
             443,
         )));
-        let response = app.oneshot(request).await.unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), 1024)
             .await
             .unwrap();
         assert_eq!(&body[..], b"tenant-a:alice");
+        claims.sub = "local-demo".into();
+        claims.tenant = "local".into();
+        let token = encode(&header, &claims, &encoding).unwrap();
+        let mut request = Request::builder()
+            .uri("/")
+            .header(header::HOST, "mesh.example")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+            "203.0.113.9".parse().unwrap(),
+            443,
+        )));
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
     }
 }

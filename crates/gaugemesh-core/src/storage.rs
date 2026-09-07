@@ -17,7 +17,7 @@ use crate::{
     },
 };
 
-const STORAGE_SCHEMA_VERSION: i64 = 2;
+const STORAGE_SCHEMA_VERSION: i64 = 3;
 const MAX_TASK_ROUTE_PURGE_RECORDS_PER_CALL: usize = 10_000;
 const MAX_STORED_TASK_ROUTES: usize = 4_096;
 const MAX_ACTIVE_TASK_ROUTES_PER_CALLER: usize = 256;
@@ -89,6 +89,13 @@ impl BeginTaskRouteResult {
 }
 
 pub trait TaskRouteStorage: Send + Sync {
+    /// Read-only recovery by caller-scoped key. This never creates or extends a route.
+    fn find_task_route(
+        &self,
+        caller: &TaskRouteCaller,
+        key: &TaskRouteIdempotencyKey,
+    ) -> Result<Option<TaskRouteRecord>, TaskRouteStorageError>;
+
     /// Atomically persists a prepared route before acknowledging it to the caller.
     ///
     /// Before its retention expiry, a caller-scoped idempotency key with the same immutable
@@ -167,6 +174,26 @@ impl LeaseStorage for MemoryStorage {
 }
 
 impl TaskRouteStorage for MemoryStorage {
+    fn find_task_route(
+        &self,
+        caller: &TaskRouteCaller,
+        key: &TaskRouteIdempotencyKey,
+    ) -> Result<Option<TaskRouteRecord>, TaskRouteStorageError> {
+        let routes = self
+            .task_routes
+            .read()
+            .map_err(|_| TaskRouteStorageError::Poisoned)?;
+        let result = routes
+            .by_idempotency
+            .get(&(caller.clone(), key.clone()))
+            .and_then(|id| routes.by_id.get(&id.0))
+            .cloned();
+        if let Some(record) = &result {
+            record.verify_integrity()?;
+        }
+        Ok(result)
+    }
+
     fn begin_or_existing(
         &self,
         record: &TaskRouteRecord,
@@ -327,7 +354,7 @@ fn bounded_task_route_purge_limit(max_records: usize) -> usize {
 
 #[derive(Debug)]
 pub struct SqliteStorage {
-    connection: Mutex<Connection>,
+    pub(crate) connection: Mutex<Connection>,
 }
 
 impl SqliteStorage {
@@ -397,6 +424,18 @@ fn migrate(connection: &mut Connection) -> Result<(), StorageError> {
              INSERT OR IGNORE INTO schema_migrations(version) VALUES (2);",
         )?;
     }
+    if current < 3 {
+        transaction.execute_batch(
+            "CREATE TABLE runs(
+                run_id TEXT PRIMARY KEY, principal TEXT NOT NULL, tenant TEXT NOT NULL,
+                run_key TEXT NOT NULL, plan_digest TEXT NOT NULL, version INTEGER NOT NULL,
+                document TEXT NOT NULL, UNIQUE(principal, tenant, run_key));
+             CREATE TABLE run_journal(
+                run_id TEXT NOT NULL, version INTEGER NOT NULL, event TEXT NOT NULL,
+                PRIMARY KEY(run_id, version));
+             INSERT INTO schema_migrations(version) VALUES (3);",
+        )?;
+    }
     transaction.commit()?;
     Ok(())
 }
@@ -446,6 +485,18 @@ impl LeaseStorage for SqliteStorage {
 }
 
 impl TaskRouteStorage for SqliteStorage {
+    fn find_task_route(
+        &self,
+        caller: &TaskRouteCaller,
+        key: &TaskRouteIdempotencyKey,
+    ) -> Result<Option<TaskRouteRecord>, TaskRouteStorageError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| TaskRouteStorageError::Poisoned)?;
+        select_task_route_by_idempotency(&connection, caller, key)
+    }
+
     fn begin_or_existing(
         &self,
         record: &TaskRouteRecord,

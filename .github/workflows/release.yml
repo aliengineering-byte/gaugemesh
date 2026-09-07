@@ -370,6 +370,16 @@ jobs:
             --source-sha "${{ needs.validate.outputs.source_sha }}"
           unzip -q "gaugemesh-${RELEASE_TAG}-x86_64-unknown-linux-gnu.zip" -d install
           chmod +x install/gaugemesh
+      - name: Exercise external Tasks and Runs from the actual downloaded public binary
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          set -euo pipefail
+          binary="$RUNNER_TEMP/public-release/install/gaugemesh"
+          source="$RUNNER_TEMP/public-gaugemesh"
+          python "$source/examples/public_tasks/consumer.py" --binary "$binary" --output "$RUNNER_TEMP/public-external-tasks" --require-late-recovery
+          python "$source/examples/public_tasks/run_consumer.py" --binary "$binary" --output "$RUNNER_TEMP/public-external-runs"
+          node "$source/examples/public_tasks/second_consumer.mjs" "$binary" "$RUNNER_TEMP/public-external-javascript"
       - name: Pull the public GHCR image without credentials
         shell: bash
         run: |
@@ -468,6 +478,7 @@ jobs:
             ${{ runner.temp }}/public-server.log
             ${{ runner.temp }}/public-resilireplay.log
             ${{ runner.temp }}/public-conformance-*
+            ${{ runner.temp }}/public-external-*
           if-no-files-found: warn
           retention-days: 30
 

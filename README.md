@@ -17,6 +17,11 @@ run the multi-architecture GHCR image. Crates.io is not a GaugeMesh distribution
 channel. The real stdio MCP server is `gaugemesh mcp-stdio`; its Official MCP
 Registry metadata is checked in as [`server.json`](server.json).
 
+The source tree also provides opt-in [bounded durable Runs](docs/durable-runs.md):
+caller-authored plans over the existing Tasks, verified file outcomes, explicit
+resume/cancel, and offline evidence verification. See that contract for the
+local Unix boundary and the external installed-binary qualification commands.
+
 ## Run the local proof
 
 From a release archive:

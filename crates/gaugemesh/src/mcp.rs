@@ -16,7 +16,7 @@ use gaugemesh_core::{
     digest::Sha256Digest,
     federation::{CompositeCursor, FederatedTool, Federation, open_cursor, seal_cursor},
     lease::{CapabilityLease, LeaseError},
-    storage::{LeaseStorage, MemoryStorage, TaskRouteStorage},
+    storage::{LeaseStorage, MemoryStorage, SqliteStorage, TaskRouteStorage},
 };
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
@@ -38,6 +38,7 @@ struct MeshMcpState {
     cursor_key: [u8; 32],
     conformance_fixture: bool,
     task_proxy: Option<TaskProxy>,
+    runs: Option<crate::runs::RunDriver>,
 }
 
 impl MeshMcpServer {
@@ -51,6 +52,7 @@ impl MeshMcpServer {
                 cursor_key: *Sha256Digest::of_bytes(uuid::Uuid::new_v4().as_bytes()).as_bytes(),
                 conformance_fixture: std::env::var_os("GAUGEMESH_CONFORMANCE_FIXTURE").is_some(),
                 task_proxy: None,
+                runs: None,
             }),
         }
     }
@@ -77,12 +79,20 @@ impl MeshMcpServer {
                 cursor_key: *Sha256Digest::of_bytes(uuid::Uuid::new_v4().as_bytes()).as_bytes(),
                 conformance_fixture: std::env::var_os("GAUGEMESH_CONFORMANCE_FIXTURE").is_some(),
                 task_proxy,
+                runs: None,
             }),
         }
     }
 
     pub fn federation(&self) -> &Federation {
         &self.state.federation
+    }
+
+    pub fn with_runs(mut self, storage: Arc<SqliteStorage>) -> Self {
+        Arc::get_mut(&mut self.state)
+            .expect("configure Runs before sharing the server")
+            .runs = Some(crate::runs::RunDriver::new(storage));
+        self
     }
 
     fn tool_result(tool: &FederatedTool, arguments: Option<&Map<String, Value>>) -> CallToolResult {
@@ -271,11 +281,19 @@ impl MeshMcpServer {
                 "Release a capability lease",
                 json!({"type":"object","properties":{"leaseId":{"type":"string"}},"required":["leaseId"],"additionalProperties":false}),
             ),
+            (
+                "gaugemesh_run",
+                "Compose a caller-supplied bounded immutable plan over durable Tasks. Resume drives one sweep; cancel persists intent. Local Unix artifact verification only.",
+                json!({"type":"object","properties":{
+                    "action":{"enum":["submit","status","resume","cancel","export","verify"]},
+                    "plan":{"type":"object"},"runId":{"type":"string"},"leaseId":{"type":"string"}},
+                    "required":["action"],"additionalProperties":false}),
+            ),
         ]
         .into_iter()
         .map(|(name, description, schema)| {
             let (read_only, destructive, idempotent, open_world) = match name {
-                "gaugemesh_invoke" | "gaugemesh_submit" => {
+                "gaugemesh_invoke" | "gaugemesh_submit" | "gaugemesh_run" => {
                     (Some(false), Some(true), Some(false), Some(true))
                 }
                 "gaugemesh_lease" => (Some(false), Some(false), Some(false), Some(false)),
@@ -779,6 +797,24 @@ impl MeshMcpServer {
     ) -> Result<CallToolResponse, McpError> {
         let arguments = arguments.unwrap_or_default();
         match name {
+            "gaugemesh_run" => {
+                let (Some(driver), Some(proxy)) = (&self.state.runs, &self.state.task_proxy) else {
+                    return Ok(tool_error("GM_RUN_DURABLE_TASKS_REQUIRED").into());
+                };
+                if !client_supports_tasks {
+                    return Ok(tool_error("GM_TASK_CLIENT_CAPABILITY_REQUIRED").into());
+                }
+                let context = crate::runs::RunContext {
+                    federation: &self.state.federation,
+                    leases: self.state.leases.as_ref(),
+                    proxy,
+                    identity,
+                };
+                match driver.call(&arguments, context).await {
+                    Ok(result) => Ok(CallToolResult::structured(result).into()),
+                    Err(error) => Ok(tool_error(format!("{error:#}")).into()),
+                }
+            }
             "gaugemesh_search" => {
                 let query = arguments.get("query").and_then(Value::as_str).unwrap_or("");
                 let limit = arguments.get("limit").and_then(Value::as_u64).unwrap_or(8) as usize;
@@ -891,16 +927,16 @@ impl MeshMcpServer {
                     return Ok(tool_error("GM_LEASE_CAPABILITY_OUTSIDE_CONE").into());
                 };
                 let now = unix_time_ms()?;
-                let authorization = lease.authorize_invocation(
-                    &identity.principal,
-                    &identity.tenant,
+                let authorization = authorize_current_invocation(
+                    &lease,
+                    identity,
                     &tool.identity,
                     tool.side_effect,
                     now,
                 );
                 match authorization {
                     Ok(()) => self.invoke_tool(tool, tool_arguments.cloned()).await,
-                    Err(error) => Ok(tool_error(lease_error_code(error)).into()),
+                    Err(code) => Ok(tool_error(code).into()),
                 }
             }
             "gaugemesh_submit" => {
@@ -938,14 +974,14 @@ impl MeshMcpServer {
                     return Ok(tool_error("GM_LEASE_CAPABILITY_OUTSIDE_CONE").into());
                 };
                 let now = unix_time_ms()?;
-                if let Err(error) = lease.authorize_invocation(
-                    &identity.principal,
-                    &identity.tenant,
+                if let Err(code) = authorize_current_invocation(
+                    &lease,
+                    identity,
                     &tool.identity,
                     SideEffectClass::NonIdempotentWrite,
                     now,
                 ) {
-                    return Ok(tool_error(lease_error_code(error)).into());
+                    return Ok(tool_error(code).into());
                 }
                 task_proxy
                     .submit(tool, tool_arguments.clone(), task, identity)
@@ -1100,11 +1136,11 @@ impl ServerHandler for MeshMcpServer {
         };
         let expose_task_submission =
             self.state.task_proxy.is_some() && context_supports_tasks(&context);
-        tools.extend(
-            Self::meta_tools()
-                .into_iter()
-                .filter(|tool| expose_task_submission || tool.name != "gaugemesh_submit"),
-        );
+        tools.extend(Self::meta_tools().into_iter().filter(|tool| {
+            (expose_task_submission || tool.name != "gaugemesh_submit")
+                && (expose_task_submission && self.state.runs.is_some()
+                    || tool.name != "gaugemesh_run")
+        }));
         if self.state.conformance_fixture {
             tools.extend(Self::conformance_tools());
         }
@@ -1710,6 +1746,29 @@ fn identity_authorizes_effect(identity: &AuthenticatedIdentity, effect: SideEffe
     identity.scopes.iter().any(|scope| scope == required_scope)
 }
 
+pub(crate) fn authorize_current_invocation(
+    lease: &CapabilityLease,
+    identity: &AuthenticatedIdentity,
+    capability: &CapabilityId,
+    effect: SideEffectClass,
+    now: u64,
+) -> Result<(), &'static str> {
+    lease
+        .authorize_invocation(
+            &identity.principal,
+            &identity.tenant,
+            capability,
+            effect,
+            now,
+        )
+        .map_err(lease_error_code)?;
+    // A previously granted lease does not preserve scopes omitted by a newer token.
+    if !identity_authorizes_effect(identity, effect) {
+        return Err("GM_LEASE_SIDE_EFFECT_SCOPE_REQUIRED");
+    }
+    Ok(())
+}
+
 fn lease_error_code(error: LeaseError) -> &'static str {
     match error {
         LeaseError::Expired => "GM_LEASE_EXPIRED",
@@ -1941,5 +2000,49 @@ mod tests {
             &identity,
             SideEffectClass::NonIdempotentWrite
         ));
+    }
+
+    #[test]
+    fn narrowed_identity_cannot_reuse_a_write_lease() {
+        let federation = Federation::demo();
+        let capability = federation.tools().next().unwrap().identity.clone();
+        let mut identity = AuthenticatedIdentity {
+            principal: PrincipalId("remote-caller".into()),
+            tenant: TenantId("tenant-a".into()),
+            scopes: vec!["gaugemesh:effect:non-idempotent-write".into()],
+        };
+        let lease = CapabilityLease::issue_with_side_effects(
+            identity.principal.clone(),
+            identity.tenant.clone(),
+            "test".into(),
+            vec![capability.clone()],
+            CapabilityScope::default(),
+            100,
+            MoneyBudgetMicros(0),
+            TokenBudget(1),
+            RetryBudget(1),
+            BTreeSet::from([SideEffectClass::NonIdempotentWrite]),
+        );
+        assert_eq!(
+            authorize_current_invocation(
+                &lease,
+                &identity,
+                &capability,
+                SideEffectClass::NonIdempotentWrite,
+                1
+            ),
+            Ok(())
+        );
+        identity.scopes.clear();
+        assert_eq!(
+            authorize_current_invocation(
+                &lease,
+                &identity,
+                &capability,
+                SideEffectClass::NonIdempotentWrite,
+                1
+            ),
+            Err("GM_LEASE_SIDE_EFFECT_SCOPE_REQUIRED")
+        );
     }
 }

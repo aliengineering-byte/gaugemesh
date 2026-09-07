@@ -92,6 +92,22 @@ jobs:
           toolchain: 1.88.0
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - run: cargo build --locked --release
+      - name: Exercise external Tasks and bounded Run consumers
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          set -euo pipefail
+          binary="$CARGO_TARGET_DIR/release/gaugemesh"
+          python examples/public_tasks/consumer.py --binary "$binary" --output "$RUNNER_TEMP/external-tasks" --require-late-recovery
+          python examples/public_tasks/run_consumer.py --binary "$binary" --output "$RUNNER_TEMP/external-runs"
+          node examples/public_tasks/second_consumer.mjs "$binary" "$RUNNER_TEMP/external-javascript"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: external-task-run-evidence
+          path: ${{ runner.temp }}/external-*
+          if-no-files-found: warn
+          retention-days: 30
       - name: Measure idle RSS and run bounded concurrent load
         shell: bash
         run: |

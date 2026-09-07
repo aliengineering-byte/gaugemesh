@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 env:
-  PACKAGE_VERSION: 0.3.0
+  PACKAGE_VERSION: 0.4.0
 
 jobs:
   archive:
@@ -116,9 +116,9 @@ jobs:
               value = tomllib.loads((root / manifest).read_text(encoding='utf-8'))
               assert value['package']['publish'] is False, f'{manifest} must remain publish=false'
           server = json.loads((root / 'server.json').read_text(encoding='utf-8'))
-          assert server['version'] == '0.3.0'
+          assert server['version'] == '0.4.0'
           assert server['packages'][0]['registryType'] == 'oci'
-          assert server['packages'][0]['identifier'] == 'ghcr.io/aliengineering-byte/gaugemesh:0.3.0'
+          assert server['packages'][0]['identifier'] == 'ghcr.io/aliengineering-byte/gaugemesh:0.4.0'
           assert server['packages'][0]['transport']['type'] == 'stdio'
           assert server['packages'][0]['packageArguments'][0]['value'] == 'mcp-stdio'
           PY
