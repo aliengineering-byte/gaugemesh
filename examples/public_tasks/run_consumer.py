@@ -128,6 +128,37 @@ def qualify(binary, root):
         assert len(h.starts(diamond_id)) == 4
         results["dagAndConcurrency"] = {"status": "PASS", "runId": diamond_id, "observedSimultaneousHeldWorkers": 2, "starts": 4}
 
+        # A true fan-out/fan-in diamond; each branch must verify before D starts.
+        fanout = h.plan("fanout-diamond", [h.step("a"),
+            h.step("b", ["a"], reference="a", hold=True),
+            h.step("c", ["a"], reference="a", hold=True),
+            h.step("d", ["b", "c"], reference="c")])
+        fanout_id = h.run("submit", plan=fanout)["runId"]
+        def branches_started():
+            state = h.run("resume", fanout_id)
+            return state if len(h.starts(fanout_id)) == 3 else None
+        branch_state = wait_for(branches_started, "A verified and B/C independently started")
+        assert branch_state["steps"]["a"]["phase"] == "verified"
+        assert branch_state["steps"]["d"]["phase"] == "pending"
+        branch_tasks = {e["binding"]["submission"]["task"]["logicalTaskId"].rsplit("/", 1)[1]: e["task"]
+            for e in h.accepted(fanout_id)}
+        assert set(branch_tasks) == {"a", "b", "c"}
+        (h.worker / (branch_tasks["b"] + ".release")).touch(exist_ok=False)
+        def first_branch_verified():
+            state = h.run("resume", fanout_id)
+            return state if state["steps"]["b"]["phase"] == "verified" else None
+        wait_for(first_branch_verified, "B verifies while C remains held")
+        for _ in range(3):
+            state = h.run("resume", fanout_id)
+            assert state["steps"]["c"]["phase"] == "routed"
+            assert state["steps"]["d"]["phase"] == "pending"
+            assert len(h.starts(fanout_id)) == 3
+        (h.worker / (branch_tasks["c"] + ".release")).touch(exist_ok=False)
+        h.finish(fanout_id)
+        assert len(h.starts(fanout_id)) == 4
+        results["trueDiamondFanoutJoin"] = {"status": "PASS", "runId": fanout_id, "starts": 4,
+            "branchesShareVerifiedPredecessor": True, "joinBlockedUntilBothBranchesVerified": True}
+
         concurrent_id = h.run("submit", plan=h.plan("concurrent-resumes", [h.step("a", hold=True)]))["runId"]
         request_ids = {h.client.send("tools/call", {"name": "gaugemesh_run", "arguments": {
             "action": "resume", "runId": concurrent_id, "leaseId": h.lease}}) for _ in range(2)}
