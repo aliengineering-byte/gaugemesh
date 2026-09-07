@@ -10,6 +10,7 @@ import mechanics
 import oracle
 import review
 import beam_worker
+import reporting
 
 
 def request():
@@ -217,6 +218,15 @@ class MechanicsTests(unittest.TestCase):
         # A one-iteration trace is not proof of a 128-iteration exhaustion.
         data["maxIterations"] = 128
         self.assertFalse(oracle.verify_refusal(data, calculation))
+
+    def test_reports_stable_after_sorted_sidecar_reload(self):
+        value = request()
+        data, calculation = self.solve(value)
+        result = review.report_base(value, "/fixture/gaugemesh", Path("/fixture/output"))
+        result.update(executionState="verified", verificationState="VERIFIED", domainStatus="MECHANICS_ONLY",
+            normalized=data, calculation=calculation, comparison=oracle.compare_demand(data, calculation))
+        self.assertEqual(reporting.documents(result), reporting.documents(json.loads(json.dumps(result, sort_keys=True))))
+        self.assertLess(len(reporting.documents(result)[1]), 10000)
 
 
 if __name__ == "__main__":

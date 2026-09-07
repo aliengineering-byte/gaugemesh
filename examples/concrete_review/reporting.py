@@ -13,6 +13,9 @@ def exclusive_json(path, value):
 
 
 def documents(result):
+    # The JSON sidecar is key-sorted. Render from the same deterministic order
+    # before the first write and after an offline reload, including nested maps.
+    result = json.loads(json.dumps(result, sort_keys=True, ensure_ascii=False, allow_nan=False))
     payload = json.dumps(result, indent=2, ensure_ascii=False, allow_nan=False)
     summary = result.get("calculation") or {}
     decimals = result.get("normalized", {}).get("displayDecimals", 3)
@@ -47,7 +50,16 @@ h1{{font-size:32px;line-height:1.2}}h2{{font-size:14px;font-weight:500;color:#49
     fence = "`" * max(3, 1 + max((len(match) for match in re.findall(r"`+", payload)), default=0))
     markdown = "# Optional section mechanics review\n\n" + "\n".join(f"- {title}: {value}" for title, value in rows)
     markdown += "\n\nOriginal declared model only; no code capacity or construction approval. Qualified professional review required.\n\n"
-    markdown += result.get("verificationCommand", "No accepted Run evidence to verify.") + "\n\n" + fence + "json\n" + payload + "\n" + fence + "\n"
+    if missing is not None:
+        markdown += "## Diagnostic\n\n" + fence + "text\n" + str(missing) + "\n" + fence + "\n\n"
+    markdown += "## Confirmed scope and assumptions\n\n" + fence + "json\n" + json.dumps(result.get("scopeAndAssumptions"), indent=2) + "\n" + fence + "\n\n"
+    markdown += "## Unrounded comparison\n\n" + fence + "json\n" + json.dumps(result.get("comparison"), indent=2) + "\n" + fence + "\n\n"
+    markdown += "Display rounding affects presentation only; the unrounded comparison uses an explicit numerical band. SERVICE/FACTORED labels apply no load or resistance factors.\n\n"
+    markdown += "## Coverage\n\n" + "\n".join(f"- {name}: {status}" for name, status in result["coverage"].items()) + "\n\n"
+    markdown += "## Evidence and verification\n\nRun: " + result.get("runId", "NOT_STARTED") + "\n\nProducer: " + result["producerSha256"] + "\n\n"
+    markdown += "Original and normalized quantities, conversion factors, all layer results, solver trace, independent checks and catalog metadata are retained in this report's corresponding JSON sidecar. Completed Run evidence is in run-export.json (paused-export.json at a checkpoint). The HTML report also contains the full structured result in its expandable appendix.\n\n"
+    markdown += fence + "sh\n" + result.get("verificationCommand", "No accepted Run evidence to verify.") + "\n" + fence + "\n\n"
+    markdown += "Keep the original root and trusted export. Integrity hashes are not signatures. Standards rules remain SOURCE_AUTHORIZATION_REQUIRED; official catalog metadata grants neither implementation rights nor jurisdictional adoption. Nothing is sent automatically.\n"
     return document, markdown
 
 
