@@ -4,7 +4,7 @@ exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -38,7 +38,8 @@ rusqlite = { version = "=0.37.0", features = ["bundled"] }
 rustix = { version = "=1.1.4", features = ["fs"] }
 schemars = { version = "=1.0.4", features = ["derive", "url2", "uuid1"] }
 serde = { version = "=1.0.229", features = ["derive"] }
-serde_json = "=1.0.151"
+# Durable JSON evidence must retain finite float bits across serialize/parse.
+serde_json = { version = "=1.0.151", features = ["float_roundtrip"] }
 serde_yaml = "=0.9.34"
 sha2 = "=0.10.9"
 subtle = "=2.6.1"

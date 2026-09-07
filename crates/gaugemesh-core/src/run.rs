@@ -281,6 +281,34 @@ mod tests {
     use crate::context::{PrincipalId, TenantId};
 
     #[test]
+    fn finite_numeric_evidence_survives_storage_and_export_round_trips() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("numbers.sqlite");
+        let caller = TaskRouteCaller::new(PrincipalId("a".into()), TenantId("t".into())).unwrap();
+        let store = SqliteStorage::open(&path).unwrap();
+        let numbers: Value = serde_json::from_str(
+            r#"[200.0000000003638,6.766666666678794e-8,1.1000000000000001e-8,4.0999999999890864e-7,0.000600009999998363,2.7284258976578712e-6,1.001e-6]"#,
+        ).unwrap();
+        let first = store
+            .begin_run(
+                caller.clone(),
+                "numeric",
+                json!({"plan":{"runKey":"numeric"},"evidence":numbers}),
+            )
+            .unwrap();
+        let reloaded = store.get_run(&caller, &first.run_id).unwrap().unwrap();
+        assert_eq!(reloaded.data, first.data);
+        let mut exported = serde_json::to_string(&reloaded).unwrap();
+        for _ in 0..4 {
+            let decoded: RunRecord = serde_json::from_str(&exported).unwrap();
+            decoded.verify_integrity().unwrap();
+            let encoded = serde_json::to_string(&decoded).unwrap();
+            assert_eq!(encoded, exported);
+            exported = encoded;
+        }
+    }
+
+    #[test]
     fn durable_caller_identity_cas_journal_and_tamper() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("state.sqlite");

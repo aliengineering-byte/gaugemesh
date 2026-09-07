@@ -4,6 +4,19 @@ All notable changes are documented here.
 
 ## Unreleased
 
+## 0.4.1 - 2026-09-07
+
+- Preserve finite JSON floating-point values through durable snapshot and export
+  parsing using the existing JSON dependency's round-trip parser. A regression
+  reproduces the 0.4.0 `GM_RUN_INTEGRITY` failure on ordinary numerical evidence.
+- Add a separate optional Python section-mechanics consumer, original declared
+  assumptions, an independent Decimal active-set oracle, durable checkpoint
+  recovery, explicit source-rights refusals and offline HTML/Markdown reports.
+  No domain formulas or dependencies enter the gateway binary.
+- Extend source and fresh-public-binary gates with numerical/refusal/tamper and
+  checkpoint acceptance. Standards remain metadata only; no authorized rules,
+  structural approval, production readiness or benchmark claim is added.
+
 ## 0.4.0 - 2026-09-07
 
 - Add opt-in, bounded caller-authored Runs over the existing durable Tasks and

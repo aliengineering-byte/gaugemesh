@@ -380,6 +380,8 @@ jobs:
           python "$source/examples/public_tasks/consumer.py" --binary "$binary" --output "$RUNNER_TEMP/public-external-tasks" --require-late-recovery
           python "$source/examples/public_tasks/run_consumer.py" --binary "$binary" --output "$RUNNER_TEMP/public-external-runs"
           node "$source/examples/public_tasks/second_consumer.mjs" "$binary" "$RUNNER_TEMP/public-external-javascript"
+          python -m unittest discover -s "$source/examples/concrete_review" -p 'test_*.py' -v
+          python "$source/examples/concrete_review/qualify.py" --binary "$binary" --output "$RUNNER_TEMP/public-external-concrete"
       - name: Pull the public GHCR image without credentials
         shell: bash
         run: |
