@@ -831,7 +831,7 @@ dependencies = [
 
 [[package]]
 name = "gaugemesh"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -847,6 +847,7 @@ dependencies = [
  "jsonwebtoken",
  "reqwest",
  "rmcp",
+ "rustix",
  "schemars",
  "serde",
  "serde_json",
@@ -866,7 +867,7 @@ dependencies = [
 
 [[package]]
 name = "gaugemesh-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "argon2",
  "base64 0.22.1",

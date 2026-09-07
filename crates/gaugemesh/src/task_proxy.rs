@@ -172,12 +172,84 @@ impl TaskProxy {
         submission: &Value,
         identity: &AuthenticatedIdentity,
     ) -> Result<CallToolResponse, McpError> {
+        self.submit_mode(tool, arguments, submission, identity, false)
+            .await
+    }
+
+    /// Recovery cannot create an absent route or dispatch a prepared one.
+    pub async fn recover_submission(
+        &self,
+        tool: &FederatedTool,
+        arguments: JsonObject,
+        submission: &Value,
+        identity: &AuthenticatedIdentity,
+    ) -> Result<CallToolResponse, McpError> {
+        self.submit_mode(tool, arguments, submission, identity, true)
+            .await
+    }
+
+    async fn submit_mode(
+        &self,
+        tool: &FederatedTool,
+        arguments: JsonObject,
+        submission: &Value,
+        identity: &AuthenticatedIdentity,
+        recovery_only: bool,
+    ) -> Result<CallToolResponse, McpError> {
         let caller = caller(identity)?;
         let now = now_unix_ms()?;
         self.store
             .purge_expired_task_routes(now, 128)
             .map_err(storage_error)?;
         let expected_provider_interface_version = tool.identity.schema_digest.to_string();
+        // An elapsed execution deadline must not prevent read-only recovery of a
+        // retained acceptance. Never use begin_or_existing on this path: a purge
+        // racing this read must not recreate a task whose deadline has elapsed.
+        if recovery_only
+            || submission
+                .get("deadlineUnixMs")
+                .and_then(Value::as_u64)
+                .is_some_and(|d| d <= now)
+        {
+            let key = submission
+                .get("idempotencyKey")
+                .and_then(Value::as_str)
+                .ok_or_else(|| McpError::invalid_params("GM_TASK_SUBMISSION_INVALID", None))?;
+            let key = TaskRouteIdempotencyKey::new(key.to_owned()).map_err(invalid_task_route)?;
+            let record = self
+                .store
+                .find_task_route(&caller, &key)
+                .map_err(storage_error)?
+                .filter(|record| !record.is_expired(now))
+                .ok_or_else(|| McpError::invalid_params("GM_TASK_DEADLINE_INVALID", None))?;
+            let parsed = TaskSubmission::parse(
+                submission,
+                &arguments,
+                &expected_provider_interface_version,
+                SideEffectClass::NonIdempotentWrite,
+                record.created_at_unix_ms,
+            )
+            .map_err(|code| McpError::invalid_params(code, None))?;
+            let snapshot = self
+                .upstreams
+                .source_snapshot_digest(&tool.identity.source)
+                .ok_or_else(|| McpError::invalid_params("GM_TASK_UPSTREAM_UNAVAILABLE", None))?;
+            if Sha256Digest::of_json(&submission_binding(tool, &parsed, snapshot))
+                != record.request_digest
+            {
+                return Err(storage_error(TaskRouteStorageError::IdempotencyConflict));
+            }
+            if record.phase == TaskRoutePhase::Prepared {
+                return self.finish_known_non_dispatch(&record, "GM_TASK_RUNTIME_BOUND_REACHED");
+            }
+            if record.phase != TaskRoutePhase::Terminal
+                && (record.phase == TaskRoutePhase::Dispatching
+                    || !self.source_binding_is_current(&record).await)
+            {
+                return self.existing_submission(self.mark_reconciliation_required(&record)?);
+            }
+            return self.existing_submission(record);
+        }
         let submission = TaskSubmission::parse(
             submission,
             &arguments,
@@ -809,12 +881,11 @@ impl TaskProxy {
         record: &TaskRouteRecord,
         code: &str,
     ) -> Result<CallToolResponse, McpError> {
-        let terminal = self.finish_terminal(
+        self.existing_submission(Self::finish_non_dispatch_once(
+            self.store.as_ref(),
             record,
-            known_rejection_task(record, code, "not_dispatched").task,
-        )?;
-        let status = cached_detailed_task(&terminal)?.status();
-        Ok(task_handle(&terminal, Some(status)))
+            code,
+        )?)
     }
 
     fn finish_known_rejection_result(
@@ -832,11 +903,39 @@ impl TaskProxy {
         record: &TaskRouteRecord,
         code: &str,
     ) -> Result<GetTaskResult, McpError> {
-        let terminal = self.finish_terminal(
-            record,
-            known_rejection_task(record, code, "not_dispatched").task,
-        )?;
-        cached_task(&terminal)
+        let current = Self::finish_non_dispatch_once(self.store.as_ref(), record, code)?;
+        if current.phase == TaskRoutePhase::Terminal {
+            cached_task(&current)
+        } else {
+            Ok(working_task(&current))
+        }
+    }
+
+    fn finish_non_dispatch_once(
+        store: &dyn TaskRouteStorage,
+        record: &TaskRouteRecord,
+        code: &str,
+    ) -> Result<TaskRouteRecord, McpError> {
+        let time = transition_time(record)?;
+        let cached =
+            serde_json::to_value(known_rejection_task(record, code, "not_dispatched").task)
+                .map_err(|_| McpError::internal_error("GM_TASK_RESULT_SERIALIZATION", None))?;
+        // This verdict belongs only to the observed version. A concurrent dispatch
+        // claim must never inherit a stale "not dispatched" completion verdict.
+        match store.compare_and_set_task_route(
+            &record.caller,
+            &record.public_task_id,
+            record.transition_version,
+            TaskRouteUpdate::terminal(time, cached),
+        ) {
+            Ok(Some(record)) => Ok(record),
+            Ok(None) => Err(unknown_task()),
+            Err(TaskRouteStorageError::StaleTransition) => store
+                .get_task_route(&record.caller, &record.public_task_id)
+                .map_err(storage_error)?
+                .ok_or_else(unknown_task),
+            Err(error) => Err(storage_error(error)),
+        }
     }
 
     fn finish_terminal(
@@ -1383,5 +1482,65 @@ mod tests {
         assert_eq!(task["executionState"], "not_dispatched");
         assert_eq!(task["policyAcceptance"], "not_evaluated_by_gaugemesh");
         assert_eq!(task["transactionOutcome"], "not_applicable_to_task_routing");
+    }
+
+    #[test]
+    fn stale_prepared_recovery_cannot_overwrite_a_dispatch_claim() {
+        use gaugemesh_core::storage::MemoryStorage;
+        let store = Arc::new(MemoryStorage::default());
+        let arguments = json!({"value":7}).as_object().unwrap().clone();
+        let parsed = TaskSubmission::parse(
+            &submission(&arguments, 1_000),
+            &arguments,
+            &Sha256Digest::of_bytes("schema").to_string(),
+            SideEffectClass::IdempotentWrite,
+            1_000,
+        )
+        .unwrap();
+        let binding = submission_binding(&tool(), &parsed, Sha256Digest::of_bytes("snapshot"));
+        let prepared = TaskRouteRecord::prepare(
+            TaskRouteCaller::new(PrincipalId("alice".into()), TenantId("tenant-a".into())).unwrap(),
+            Some(TaskRouteIdempotencyKey::new("key-1").unwrap()),
+            Sha256Digest::of_json(&binding),
+            binding,
+            tool().identity,
+            "session".into(),
+            1000,
+            60_000,
+        )
+        .unwrap();
+        store.begin_or_existing(&prepared).unwrap();
+        let read_barrier = Arc::new(std::sync::Barrier::new(2));
+        let claimed_barrier = Arc::new(std::sync::Barrier::new(2));
+        let recovery = {
+            let (store, prepared, read_barrier, claimed_barrier) = (
+                store.clone(),
+                prepared.clone(),
+                read_barrier.clone(),
+                claimed_barrier.clone(),
+            );
+            std::thread::spawn(move || {
+                let stale = store
+                    .get_task_route(&prepared.caller, &prepared.public_task_id)
+                    .unwrap()
+                    .unwrap();
+                read_barrier.wait();
+                claimed_barrier.wait();
+                TaskProxy::finish_non_dispatch_once(store.as_ref(), &stale, "deadline").unwrap()
+            })
+        };
+        read_barrier.wait();
+        store
+            .compare_and_set_task_route(
+                &prepared.caller,
+                &prepared.public_task_id,
+                0,
+                TaskRouteUpdate::dispatching("live-dispatcher".into(), 1001),
+            )
+            .unwrap();
+        claimed_barrier.wait();
+        let recovered = recovery.join().unwrap();
+        assert_eq!(recovered.phase, TaskRoutePhase::Dispatching);
+        assert!(recovered.cached_terminal_state.is_none());
     }
 }

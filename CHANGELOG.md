@@ -4,6 +4,17 @@ All notable changes are documented here.
 
 ## Unreleased
 
+## 0.4.0 - 2026-09-07
+
+- Add opt-in, bounded caller-authored Runs over the existing durable Tasks and
+  SQLite store, with immutable plans, atomic state/journal transitions, explicit
+  driving, required artifact verification, and an offline export verifier.
+- Add external Python and JavaScript callers/workers and a release gate against
+  the actual downloaded public binary, separate from historical 3/13 evidence.
+- Reject remote use of the reserved local identity, recheck current token effect
+  scopes on invocation, and recover retained expired-deadline tasks without
+  allowing new expired execution or stale non-dispatch verdicts.
+
 ## 0.3.0 - 2026-09-06
 
 - Add a bounded, SQLite-backed MCP 2026-07-28 Tasks route with caller-scoped

@@ -27,6 +27,7 @@ mod model;
 mod outbound;
 mod policy_gate;
 mod registry;
+mod runs;
 mod task_proxy;
 mod verify;
 
@@ -44,6 +45,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Verify an exported Run and its bound artifacts offline, without executing work.
+    RunVerify {
+        #[arg(long)]
+        evidence: PathBuf,
+    },
     /// Run the local, credential-free proof.
     Demo {
         /// Retain evidence at .gaugemesh/demo-evidence.json.
@@ -243,6 +249,20 @@ async fn main() -> Result<()> {
             admin_address,
         } => serve(config.as_deref(), data_address, admin_address).await,
         Command::McpStdio { config } => serve_stdio(config.as_deref()).await,
+        Command::RunVerify { evidence } => {
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            std::fs::File::open(evidence)?
+                .take(3 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)?;
+            anyhow::ensure!(bytes.len() <= 3 * 1024 * 1024, "GM_RUN_EVIDENCE_BOUND");
+            let record = serde_json::from_slice(&bytes)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&runs::verify_record(&record)?)?
+            );
+            Ok(())
+        }
         Command::NeutralUpstream { root } => {
             outbound::qualification::serve_neutral_upstream(root).await
         }
@@ -750,14 +770,16 @@ async fn runtime_mcp(
     gaugemesh_core::federation::Federation,
     Option<std::sync::Arc<outbound::UpstreamRuntime>>,
 )> {
-    let (lease_storage, task_routes): (
+    type RuntimeStores = (
         std::sync::Arc<dyn LeaseStorage>,
         Option<std::sync::Arc<dyn TaskRouteStorage>>,
-    ) = match &config.runtime {
-        RuntimeConfig::Memory => (std::sync::Arc::new(MemoryStorage::default()), None),
+        Option<std::sync::Arc<SqliteStorage>>,
+    );
+    let (lease_storage, task_routes, run_storage): RuntimeStores = match &config.runtime {
+        RuntimeConfig::Memory => (std::sync::Arc::new(MemoryStorage::default()), None, None),
         RuntimeConfig::Sqlite { database } => {
             let storage = std::sync::Arc::new(SqliteStorage::open(database)?);
-            (storage.clone(), Some(storage))
+            (storage.clone(), Some(storage.clone()), Some(storage))
         }
     };
     if config.mcp_sources.is_empty() {
@@ -784,6 +806,10 @@ async fn runtime_mcp(
         task_routes,
         config.capability_mode,
     );
+    let server = match run_storage {
+        Some(storage) => server.with_runs(storage),
+        None => server,
+    };
     Ok((server, federation, Some(upstreams)))
 }
 
